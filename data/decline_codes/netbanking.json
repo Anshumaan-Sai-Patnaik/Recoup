@@ -1,0 +1,49 @@
+{
+  "_source_note": "Netbanking standing instructions are governed per-bank, with no single published cross-bank rulebook the way card networks have. These mnemonic codes and their soft/hard categorization are our own reasonable modeling of commonly-seen netbanking failure reasons, not an official published list. See notes/IDEA.md §9 for the same honesty point applied to retry limits.",
+  "codes": {
+    "SESSION_TIMEOUT": {
+      "category": "soft",
+      "description": "Bank portal session timed out during authorization"
+    },
+    "BANK_PORTAL_DOWN": {
+      "category": "soft",
+      "description": "Bank's netbanking portal unreachable/down"
+    },
+    "INSUFFICIENT_BALANCE": {
+      "category": "soft",
+      "description": "Insufficient balance in linked bank account"
+    },
+    "BANK_MAINTENANCE_WINDOW": {
+      "category": "soft",
+      "description": "Bank undergoing scheduled maintenance"
+    },
+    "DAILY_LIMIT_EXCEEDED": {
+      "category": "soft",
+      "description": "Netbanking daily transaction limit exceeded"
+    },
+    "GATEWAY_TIMEOUT": {
+      "category": "soft",
+      "description": "Timeout between payment gateway and bank's netbanking system"
+    },
+    "SI_CANCELLED": {
+      "category": "hard",
+      "description": "Customer cancelled the standing instruction"
+    },
+    "SI_EXPIRED": {
+      "category": "hard",
+      "description": "Standing instruction validity period has ended"
+    },
+    "ACCOUNT_CLOSED": {
+      "category": "hard",
+      "description": "Linked bank account has been closed"
+    },
+    "ACCOUNT_FROZEN": {
+      "category": "hard",
+      "description": "Linked bank account frozen by the bank"
+    },
+    "INVALID_SI_REFERENCE": {
+      "category": "hard",
+      "description": "Standing instruction reference is invalid or not found"
+    }
+  }
+}

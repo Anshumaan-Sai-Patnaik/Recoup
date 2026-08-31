@@ -1,0 +1,53 @@
+{
+  "_source_note": "UPI has no single published numeric decline-code standard the way card networks do (NPCI does not publish a public rulebook of this kind). These mnemonic codes and their soft/hard categorization are our own reasonable modeling of commonly-seen UPI failure reasons, not an official NPCI list. See notes/IDEA.md §9 for the same honesty point applied to retry limits.",
+  "codes": {
+    "PIN_ENTRY_TIMEOUT": {
+      "category": "soft",
+      "description": "Customer did not enter UPI PIN in time"
+    },
+    "COLLECT_REQUEST_EXPIRED": {
+      "category": "soft",
+      "description": "Collect request expired before being actioned"
+    },
+    "BANK_SERVER_UNREACHABLE": {
+      "category": "soft",
+      "description": "Issuing bank's server unreachable at time of request"
+    },
+    "INSUFFICIENT_BALANCE": {
+      "category": "soft",
+      "description": "Insufficient balance in linked bank account"
+    },
+    "BANK_MAINTENANCE_WINDOW": {
+      "category": "soft",
+      "description": "Issuing bank undergoing scheduled maintenance"
+    },
+    "DAILY_LIMIT_EXCEEDED": {
+      "category": "soft",
+      "description": "UPI daily transaction limit exceeded"
+    },
+    "NPCI_SWITCH_TIMEOUT": {
+      "category": "soft",
+      "description": "Timeout at the NPCI switch routing the request"
+    },
+    "MANDATE_REVOKED": {
+      "category": "hard",
+      "description": "Customer revoked the UPI Autopay mandate"
+    },
+    "MANDATE_EXPIRED": {
+      "category": "hard",
+      "description": "UPI Autopay mandate validity period has ended"
+    },
+    "INVALID_VPA": {
+      "category": "hard",
+      "description": "Linked VPA is invalid or no longer exists"
+    },
+    "ACCOUNT_BLOCKED": {
+      "category": "hard",
+      "description": "Linked bank account blocked or frozen"
+    },
+    "TRANSACTION_DECLINED_BY_CUSTOMER": {
+      "category": "hard",
+      "description": "Customer actively declined the debit request"
+    }
+  }
+}

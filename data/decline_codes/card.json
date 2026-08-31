@@ -1,0 +1,61 @@
+{
+  "_source_note": "Codes and soft/hard categorization are commonly-reported industry figures (ISO 8583-style response codes summarized in payments/gateway blog posts), not pulled from a card network's own paywalled rulebook. See notes/IDEA.md §9 for why this distinction matters.",
+  "codes": {
+    "51": {
+      "category": "soft",
+      "description": "Insufficient funds"
+    },
+    "91": {
+      "category": "soft",
+      "description": "Issuer or switch inoperative (issuer timeout)"
+    },
+    "96": {
+      "category": "soft",
+      "description": "System malfunction at the issuer"
+    },
+    "61": {
+      "category": "soft",
+      "description": "Exceeds withdrawal/transaction amount limit"
+    },
+    "65": {
+      "category": "soft",
+      "description": "Activity/velocity count limit exceeded"
+    },
+    "05": {
+      "category": "hard",
+      "description": "Do not honor (generic issuer decline)"
+    },
+    "54": {
+      "category": "hard",
+      "description": "Expired card"
+    },
+    "43": {
+      "category": "hard",
+      "description": "Lost card, pick up"
+    },
+    "41": {
+      "category": "hard",
+      "description": "Stolen card, pick up"
+    },
+    "59": {
+      "category": "hard",
+      "description": "Suspected fraud"
+    },
+    "14": {
+      "category": "hard",
+      "description": "Invalid card number"
+    },
+    "62": {
+      "category": "hard",
+      "description": "Restricted card"
+    },
+    "57": {
+      "category": "hard",
+      "description": "Transaction not permitted to cardholder"
+    },
+    "75": {
+      "category": "hard",
+      "description": "Allowable PIN entry tries exceeded"
+    }
+  }
+}
