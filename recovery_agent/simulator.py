@@ -17,8 +17,10 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from typing import Optional
 
 from recovery_agent.models import (
+    AttemptOutcome,
     BillingEvent,
     Customer,
     DeclineCategory,
@@ -27,6 +29,7 @@ from recovery_agent.models import (
     MandateChannel,
     MandateRegistration,
     Merchant,
+    TransactionState,
 )
 
 # Default demo merchant flavor — a small fixed set of fake identities, per
@@ -78,6 +81,33 @@ class SimulatorConfig:
     soft_recoverable_ratio: float = 0.85
     hard_recoverable_via_switch_ratio: float = 0.5
     recoverable_wait_hours_range: tuple[float, float] = (1.0, 48.0)
+    # "Mass failure" scenario mode, per ARCHITECTURE.md A2 operation 10 — force a
+    # fraction of customers' billing events to fail at the *same* simulated instant,
+    # specifically to give the Pacing component's Jitter half (B3, Phase 6) a
+    # thundering-herd condition to be tested against. Off by default; a normal batch
+    # run leaves each customer's billing event spaced out by their own cycle length.
+    mass_failure_scenario: bool = False
+    mass_failure_fraction: float = 0.3
+
+
+class SimulatedClock:
+    """A simulated clock that can be advanced arbitrarily (simulated hours/days) with
+    no real waiting — per ARCHITECTURE.md A2 operation 7. Nothing here reads the real
+    system clock; "now" is purely whatever this object says it is, so a whole batch of
+    thousands of retry waits can be fast-forwarded through instantly."""
+
+    def __init__(self, start_time: datetime):
+        self.current_time = start_time
+
+    def now(self) -> datetime:
+        return self.current_time
+
+    def advance(self, delta: timedelta) -> datetime:
+        self.current_time += delta
+        return self.current_time
+
+    def advance_hours(self, hours: float) -> datetime:
+        return self.advance(timedelta(hours=hours))
 
 
 class Simulator:
@@ -105,6 +135,11 @@ class Simulator:
         # task) and the Metrics engine (Phase 11) are meant to ever read this.
         self.hidden_truths: dict[str, HiddenTruthRecord] = {}
         self._customers_by_id: dict[str, Customer] = {}
+        self._billing_events_by_id: dict[str, BillingEvent] = {}
+        # The simulated clock (A2 operation 7) — starts at the same instant the
+        # population's billing events are scheduled from, so "elapsed time since
+        # failure" in respond_to_attempt has a sane zero point.
+        self.clock = SimulatedClock(config.start_time)
         self._generate_merchants()
         self._generate_customers()
         self._generate_billing_events()
@@ -144,12 +179,33 @@ class Simulator:
 
     def _generate_billing_events(self) -> None:
         """ARCHITECTURE.md A2 operation 3 — one billing event per customer per
-        configured cycle, each rolling independently whether it fails."""
+        configured cycle, each rolling independently whether it fails.
+
+        If `mass_failure_scenario` is enabled (operation 10), a configured fraction of
+        customers are pre-selected (via the same seeded RNG, so it's still
+        reproducible) to have their *first* cycle's billing event forced to fail and
+        forced onto the exact same simulated instant — a thundering-herd condition for
+        exercising the Pacing component's Jitter half later (Phase 6)."""
+        mass_failure_customer_ids: set[str] = set()
+        mass_failure_instant = self.config.start_time + timedelta(
+            days=self.config.billing_cycle_days
+        )
+        if self.config.mass_failure_scenario:
+            num_mass_failures = round(len(self.customers) * self.config.mass_failure_fraction)
+            mass_failure_customer_ids = {
+                c.customer_id
+                for c in self.rng.sample(self.customers, min(num_mass_failures, len(self.customers)))
+            }
+
         for customer in self.customers:
             for cycle_index in range(self.config.num_cycles):
                 event_id = f"{customer.customer_id}_cycle{cycle_index + 1}"
-                scheduled_at = self.config.start_time + timedelta(
-                    days=customer.billing_cycle_days * (cycle_index + 1)
+                is_mass_failure = cycle_index == 0 and customer.customer_id in mass_failure_customer_ids
+                scheduled_at = (
+                    mass_failure_instant
+                    if is_mass_failure
+                    else self.config.start_time
+                    + timedelta(days=customer.billing_cycle_days * (cycle_index + 1))
                 )
                 event = BillingEvent(
                     billing_event_id=event_id,
@@ -158,7 +214,8 @@ class Simulator:
                     scheduled_at=scheduled_at,
                 )
                 self.billing_events.append(event)
-                if self.rng.random() < self.config.base_failure_rate:
+                self._billing_events_by_id[event_id] = event
+                if is_mass_failure or self.rng.random() < self.config.base_failure_rate:
                     self.failed_billing_event_ids.add(event_id)
 
     def _assign_first_attempt_declines(self) -> None:
@@ -239,3 +296,72 @@ class Simulator:
                 )
 
             self.hidden_truths[event.billing_event_id] = record
+
+    def respond_to_attempt(
+        self,
+        transaction: TransactionState,
+        channel: MandateChannel,
+        route: Optional[str],
+        current_time: datetime,
+    ) -> tuple[AttemptOutcome, Optional[str], Optional[DeclineCategory]]:
+        """ARCHITECTURE.md A2 operation 8 — the core "fake bank" verdict function.
+
+        Given a transaction, the channel/route an attempt is being made on, and the
+        current simulated time, consults that transaction's Hidden Truth Record (never
+        exposed to any decision-making component) and the simulated time elapsed since
+        the original failure, and returns approve, or decline + a specific decline code
+        and its category.
+
+        `route` is accepted per the architecture's function signature (a card-specific
+        sub-arm, e.g. a different acquiring route for the same card) but the current
+        Hidden Truth model doesn't distinguish outcomes by route within a channel — only
+        by channel. Recorded for future use, not consulted yet.
+        """
+        del route  # not yet modeled — see docstring
+        truth = self.hidden_truths.get(transaction.billing_event_id)
+        if truth is None:
+            # No failure was ever generated for this billing event, so there's nothing
+            # to recover from — treat any attempt against it as trivially approved.
+            return AttemptOutcome.APPROVED, None, None
+
+        billing_event = self._billing_events_by_id[transaction.billing_event_id]
+        customer = self._customers_by_id[transaction.customer_id]
+        # Retry number counts attempts already recorded on this transaction's own
+        # journey (i.e. retries after the original failure), matching how
+        # `recoverable_on_attempt_number` was generated in _generate_hidden_truths.
+        retry_number = len(transaction.attempts) + 1
+        elapsed_seconds = (current_time - billing_event.scheduled_at).total_seconds()
+
+        channel_is_recoverable = truth.is_recoverable and channel in truth.recoverable_channels
+        if (
+            channel_is_recoverable
+            and elapsed_seconds >= (truth.recoverable_after_seconds or 0.0)
+            and retry_number >= (truth.recoverable_on_attempt_number or 1)
+        ):
+            return AttemptOutcome.APPROVED, None, None
+
+        # Still declined. Pick a category honestly reflecting the truth we're
+        # withholding: a channel that *will* eventually work just hasn't met its wait
+        # time / attempt-number condition yet, so it reads as a soft (temporary)
+        # decline; a channel with no path to recovery at all reads as hard only when
+        # it's the customer's primary channel and the original diagnosis was hard
+        # (a permanently dead primary channel stays hard on every retry) — every other
+        # never-recoverable case still reads as soft, since the agent has no way of
+        # knowing in advance that persistence here is futile.
+        if channel_is_recoverable:
+            category = DeclineCategory.SOFT
+        elif (
+            channel == customer.primary_channel()
+            and self.first_attempt_category.get(transaction.billing_event_id) == DeclineCategory.HARD
+        ):
+            category = DeclineCategory.HARD
+        else:
+            category = DeclineCategory.SOFT
+
+        codes_in_category = [
+            code
+            for code, cat in DeclineCodeRegistry.all_codes(channel).items()
+            if cat == category
+        ]
+        code = self.rng.choice(codes_in_category)
+        return AttemptOutcome.DECLINED, code, category
