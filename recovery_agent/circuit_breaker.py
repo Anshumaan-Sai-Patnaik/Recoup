@@ -142,3 +142,65 @@ def _closed_by_assumed_cap(
     window_days, max_attempts = _ASSUMED_CAPS[channel]
     count = _channel_attempt_count(transaction, channel, now, window_days=window_days)
     return count >= max_attempts
+
+
+def _closed_by_hard_decline(transaction: TransactionState, channel: MandateChannel) -> bool:
+    """Any channel closes immediately, regardless of attempt count, the moment its
+    most recent attempt on this transaction came back hard (ARCHITECTURE.md B4,
+    operation 5). A hard decline is a permanent signal (e.g. lost/stolen card, mandate
+    revoked) — no rolling window or spacing check applies, unlike the soft-decline
+    rules above.
+    """
+    last = _most_recent_attempt(transaction, channel)
+    return last is not None and last.decline_category == DeclineCategory.HARD
+
+
+def is_channel_open(
+    transaction: TransactionState, channel: MandateChannel, now: datetime
+) -> bool:
+    """Whether `channel` may still be attempted again for this transaction right now
+    — the single source of truth combining every closure rule above (Visa rule +
+    24h spacing + assumed UPI/netbanking caps + immediate hard-decline closure).
+    """
+    if _closed_by_hard_decline(transaction, channel):
+        return False
+    if channel == MandateChannel.CARD:
+        if _card_closed_by_visa_rule(transaction, now):
+            return False
+        if _card_closed_by_spacing_rule(transaction, now):
+            return False
+        return True
+    if _closed_by_assumed_cap(transaction, channel, now):
+        return False
+    return True
+
+
+def get_channel_status(
+    transaction: TransactionState,
+    registered_channels: list[MandateChannel],
+    now: datetime,
+) -> dict[MandateChannel, str]:
+    """The Bandit's (B2) required per-attempt input: for every channel this customer
+    has registered, whether it is currently `"open"` (further attempts permitted) or
+    `"closed"` (must not be attempted again for this transaction) — ARCHITECTURE.md
+    B4, operation 6. Only registered channels are reported; a channel the customer
+    never had on file is meaningless to report a status for.
+    """
+    return {
+        channel: "open" if is_channel_open(transaction, channel, now) else "closed"
+        for channel in registered_channels
+    }
+
+
+def all_channels_closed(
+    transaction: TransactionState,
+    registered_channels: list[MandateChannel],
+    now: datetime,
+) -> bool:
+    """The Orchestrator's (D1) trigger condition for routing to Human Fallback (B5):
+    every one of this customer's registered channels is closed — never a count-based
+    trigger of its own, purely derived from `get_channel_status` (ARCHITECTURE.md B4,
+    operation 7).
+    """
+    status = get_channel_status(transaction, registered_channels, now)
+    return all(s == "closed" for s in status.values())
