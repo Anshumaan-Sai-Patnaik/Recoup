@@ -8,6 +8,7 @@ notes/ARCHITECTURE.md Part B3 for the full role description.
 
 from __future__ import annotations
 
+import random
 from collections import deque
 from dataclasses import dataclass
 
@@ -43,6 +44,34 @@ INITIAL_AGGRESSIVENESS = 0.5
 """Where a fresh batch run starts — a neutral midpoint, neither maximally
 cautious nor maximally aggressive, since there's no evidence yet either
 way about how healthy the system is."""
+
+BASE_WAIT_MIN_HOURS = 1.0
+"""The shortest base wait AIMD will ever hand back, at maximum
+aggressiveness — deliberately matched to the low end of the Simulator's
+own `recoverable_wait_hours_range` (`simulator.py`,
+`SimulatorConfig.recoverable_wait_hours_range = (1.0, 48.0)`): 1 hour is
+roughly the fastest a genuinely-recoverable transaction could plausibly
+turn around, so it's meaningless for Pacing to ever retry sooner than
+that even when it fully trusts the system."""
+
+BASE_WAIT_MAX_HOURS = 48.0
+"""The longest base wait AIMD will ever hand back, at minimum
+aggressiveness — matched to the *high* end of that same
+`recoverable_wait_hours_range`, for the same reason from the other
+direction: when the system is unhealthy, back off all the way out to the
+slowest plausible recovery window rather than inventing a separate,
+disconnected timescale."""
+
+JITTER_FRACTION = 0.2
+"""Jitter is a bounded random offset within +/-20% of the base wait
+(ARCHITECTURE.md B3 operation 7) — large enough to meaningfully break up
+a thundering herd scheduled around the same base wait, small enough that
+Jitter still reads as noise on top of AIMD's number rather than a second
+source of pacing."""
+
+JITTERED_WAIT_MIN_HOURS = 0.1
+"""Floor on the final (base + jitter) wait, so a downward jitter roll at
+the smallest base wait can never produce a zero or negative wait time."""
 
 
 class RollingOutcomeWindow:
@@ -137,3 +166,41 @@ class AimdState:
                 self.aggressiveness * MULTIPLICATIVE_DECREASE_FACTOR, MIN_AGGRESSIVENESS
             )
         return self.aggressiveness
+
+    def base_wait_hours(self) -> float:
+        """Translate the current `aggressiveness` into a base wait time, in
+        simulated hours, before the next attempt (ARCHITECTURE.md B3
+        operation 6).
+
+        Linear, inverse mapping across `[MIN_AGGRESSIVENESS,
+        MAX_AGGRESSIVENESS]` onto `[BASE_WAIT_MIN_HOURS,
+        BASE_WAIT_MAX_HOURS]`: higher aggressiveness (system trusted to be
+        healthy) means a *shorter* wait, lower aggressiveness (system
+        backing off) means a *longer* one. `MAX_AGGRESSIVENESS` maps
+        exactly to `BASE_WAIT_MIN_HOURS` and `MIN_AGGRESSIVENESS` maps
+        exactly to `BASE_WAIT_MAX_HOURS`; nothing here needs jitter yet —
+        that's layered on top by `apply_jitter`.
+        """
+        span = MAX_AGGRESSIVENESS - MIN_AGGRESSIVENESS
+        normalized = (self.aggressiveness - MIN_AGGRESSIVENESS) / span
+        wait_span = BASE_WAIT_MAX_HOURS - BASE_WAIT_MIN_HOURS
+        return BASE_WAIT_MAX_HOURS - normalized * wait_span
+
+
+def apply_jitter(base_wait_hours: float, rng: random.Random) -> float:
+    """Add a bounded random offset to a base wait (ARCHITECTURE.md B3
+    operations 7-8), so transactions whose AIMD-computed base wait would
+    otherwise land at the same simulated instant don't all fire in
+    perfect synchrony (the thundering-herd condition the Simulator's
+    "mass failure" mode, per ARCHITECTURE.md A2 operation 10, exists to
+    exercise).
+
+    The offset is drawn uniformly from +/- `JITTER_FRACTION` of the base
+    wait, via a caller-supplied `random.Random` — never the global
+    `random` module, matching the seeded-reproducibility convention
+    already used throughout `simulator.py` and `bandit.py` — and the
+    result is floored at `JITTERED_WAIT_MIN_HOURS` so a downward roll can
+    never produce a zero or negative wait.
+    """
+    offset = rng.uniform(-JITTER_FRACTION, JITTER_FRACTION) * base_wait_hours
+    return max(base_wait_hours + offset, JITTERED_WAIT_MIN_HOURS)
