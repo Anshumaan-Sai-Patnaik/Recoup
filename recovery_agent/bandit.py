@@ -10,12 +10,19 @@ description.
 
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
 from datetime import datetime
 from typing import NamedTuple
 
 from recovery_agent import circuit_breaker
 from recovery_agent.models import Customer, DeclineCategory, MandateChannel, TransactionState
+
+DEFAULT_EPSILON = 0.1
+"""Explore probability for `select_arm` — a demo-scale default (per DESIGN.md B2:
+epsilon-greedy is a hand-rolled, explainable ~30-line algorithm, not tuned against
+real traffic). Callers needing a different explore/exploit balance pass their own
+`epsilon` to `select_arm` rather than relying on this constant."""
 
 
 class BanditContext(NamedTuple):
@@ -153,3 +160,48 @@ def available_arms(
     registered = _ordered_registered_channels(customer)
     status = circuit_breaker.get_channel_status(transaction, registered, now)
     return [channel for channel in registered if status[channel] == "open"]
+
+
+def select_arm(
+    available_arms: list[MandateChannel],
+    context: BanditContext,
+    stats_pool: BanditStatsPool,
+    rng: random.Random,
+    epsilon: float = DEFAULT_EPSILON,
+) -> MandateChannel:
+    """Epsilon-greedy arm selection (ARCHITECTURE.md B2, operation 4).
+
+    Chooses only among `available_arms` — the caller (the Orchestrator, D1) is
+    responsible for having already filtered that list down via `available_arms()`
+    above, so this function never has the chance to override the Circuit Breaker
+    (B4, operation 6): there is no closed arm in scope for it to pick.
+
+    With probability `epsilon`, explores: picks uniformly at random among
+    `available_arms` via the supplied `rng`, so arm choice stays reproducible for
+    a given seed (per DESIGN.md A2's seeded-reproducibility pattern, the same
+    `random.Random` convention `simulator.py` already uses — never the global
+    `random` module). Otherwise exploits: picks the arm with the highest observed
+    `success_rate` in `context`, breaking ties by `available_arms` order (its
+    first-registered-channel-first ordering from `_ordered_registered_channels`)
+    rather than randomly, so a tie doesn't silently make an otherwise-seeded run
+    non-reproducible.
+
+    `available_arms` must be non-empty — an empty list means every registered
+    channel is closed, which is the Orchestrator's signal to route to Human
+    Fallback (B5) instead of calling the Bandit at all; it is not a case this
+    function is meant to handle.
+    """
+    if not available_arms:
+        raise ValueError("select_arm requires at least one available arm")
+
+    if rng.random() < epsilon:
+        return rng.choice(available_arms)
+
+    best_arm = available_arms[0]
+    best_rate = stats_pool.get_stats(context, best_arm).success_rate
+    for arm in available_arms[1:]:
+        rate = stats_pool.get_stats(context, arm).success_rate
+        if rate > best_rate:
+            best_arm = arm
+            best_rate = rate
+    return best_arm
