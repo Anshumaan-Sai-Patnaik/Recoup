@@ -304,11 +304,32 @@ def run_transaction(
         result.terminal_reason = "unrecognized_decline_code"
         return result
 
-    pending = circuit_breaker.PendingDecline(
+    # Two different things are tracked from here, and conflating them into one variable
+    # was a real bug: the agent retried cards that had hard-declined on the original
+    # charge (see notes/TRACKER.md's resolved Phase 8 finding).
+    #
+    # `origin_decline` is the original billing-event failure. It is set once and **never
+    # reassigned**, because it is the only surviving record of that failure anywhere —
+    # the original charge is deliberately not an `AttemptRecord` (the Phase 2
+    # convention), so if this variable stops carrying it, nothing remembers it at all.
+    # Every Circuit Breaker call below gets this one.
+    origin_decline = circuit_breaker.PendingDecline(
         channel=initial_channel,
         category=initial_category,
         occurred_at=billing_event.scheduled_at,
     )
+
+    # `context_decline` is whichever decline *this round* is reacting to — the original
+    # failure on the first pass, then the most recent attempt's decline. It is what the
+    # Bandit keys its learning on and what the audit trail records as this round's
+    # context. It must move; `origin_decline` must not.
+    #
+    # Handing B4 the latest decline instead loses nothing, which is why this split is
+    # safe: every retry decline is written to `transaction.attempts` before the next
+    # round begins, so the Circuit Breaker already sees recent declines through the
+    # attempt records. The original failure was the only thing it could not see for
+    # itself.
+    context_decline = origin_decline
 
     while not is_terminal(transaction):
         now = clock.now()
@@ -320,9 +341,9 @@ def run_transaction(
         # spacing rule closes a channel *temporarily*, and a transaction must wait it
         # out rather than treat it as an option lost.
         channel_status = circuit_breaker.get_channel_status(
-            transaction, registered, now, pending
+            transaction, registered, now, origin_decline
         )
-        arms = available_arms(customer, transaction, now, pending)
+        arms = available_arms(customer, transaction, now, origin_decline)
 
         # Operation 4 — no automated options left anywhere, so B5 ends the journey.
         if not arms:
@@ -330,7 +351,7 @@ def run_transaction(
                 channel
                 for channel in registered
                 if circuit_breaker.is_channel_permanently_closed(
-                    transaction, channel, pending
+                    transaction, channel, origin_decline
                 )
             ]
             result.human_fallback_event = run_human_fallback(
@@ -345,7 +366,9 @@ def run_transaction(
             break
 
         # Operation 5 — the Bandit chooses among the arms B4 still permits.
-        context: BanditContext = context_key(pending.channel, pending.category)
+        context: BanditContext = context_key(
+            context_decline.channel, context_decline.category
+        )
         chosen = select_arm(
             arms, context, runtime.stats_pool, runtime.rng, epsilon=config.epsilon
         )
@@ -365,7 +388,7 @@ def run_transaction(
         # free to wait longer than the minimum whenever system health says it should.
         proposed_at = now + timedelta(hours=jittered_wait)
         attempt_at = circuit_breaker.earliest_next_attempt_at(
-            transaction, chosen, proposed_at, pending
+            transaction, chosen, proposed_at, origin_decline
         )
         spacing_applied = attempt_at > proposed_at
 
@@ -382,7 +405,9 @@ def run_transaction(
         # filtering and the spacing floor above disagreed with the rule they are meant
         # to be enforcing, which is a sequencing bug in this file — so it fails loudly
         # rather than quietly making an attempt a real payment network would penalise.
-        if not circuit_breaker.is_channel_open(transaction, chosen, attempt_at, pending):
+        if not circuit_breaker.is_channel_open(
+            transaction, chosen, attempt_at, origin_decline
+        ):
             raise RuntimeError(
                 f"Orchestrator was about to attempt {chosen.value!r} on "
                 f"{transaction.transaction_id!r} at {attempt_at.isoformat()}, but the "
@@ -415,7 +440,7 @@ def run_transaction(
                 channel=chosen,
                 route=None,
                 attempted_at=attempt_at,
-                chosen_arm=_arm_label(chosen, pending.channel),
+                chosen_arm=_arm_label(chosen, context_decline.channel),
                 outcome=outcome,
                 decline_code=decline_code,
                 decline_category=category,
@@ -430,12 +455,12 @@ def run_transaction(
                 transaction_id=transaction.transaction_id,
                 attempt_number=len(transaction.attempts),
                 decided_at=now,
-                context_channel=pending.channel,
-                context_category=pending.category,
+                context_channel=context_decline.channel,
+                context_category=context_decline.category,
                 channel_status=tuple(channel_status.items()),
                 available_arms=tuple(arms),
                 chosen_channel=chosen,
-                chosen_arm=_arm_label(chosen, pending.channel),
+                chosen_arm=_arm_label(chosen, context_decline.channel),
                 rolling_success_rate=rolling_success_rate,
                 baseline_success_rate=baseline_success_rate,
                 health_signal=health_signal,
@@ -472,7 +497,10 @@ def run_transaction(
             result.terminal_reason = "unrecognized_decline_code"
             break
 
-        pending = circuit_breaker.PendingDecline(
+        # Only the *context* moves on. `origin_decline` stays exactly as it was — that
+        # is the whole point of the split, and reassigning it here is the bug this file
+        # used to have.
+        context_decline = circuit_breaker.PendingDecline(
             channel=chosen, category=category, occurred_at=attempt_at
         )
 
