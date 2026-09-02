@@ -13,7 +13,7 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass
 from datetime import datetime
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 from recovery_agent import circuit_breaker
 from recovery_agent.models import Customer, DeclineCategory, MandateChannel, TransactionState
@@ -141,25 +141,49 @@ def _ordered_registered_channels(customer: Customer) -> list[MandateChannel]:
 
 
 def available_arms(
-    customer: Customer, transaction: TransactionState, now: datetime
+    customer: Customer,
+    transaction: TransactionState,
+    now: datetime,
+    pending_decline: Optional[circuit_breaker.PendingDecline] = None,
 ) -> list[MandateChannel]:
-    """The set of channels the Bandit is allowed to choose from right now.
+    """The set of channels the Bandit is allowed to choose from.
 
     An arm is available only if it's both something this customer actually has
     registered (ARCHITECTURE.md B2 operation 1 — the agent can't spontaneously
     invent a mandate channel the customer never set up, per IDEA.md §5a) *and*
-    currently reported "open" by the Circuit Breaker (B4). The Bandit chooses
-    only among whatever the Circuit Breaker still permits — it never overrules
-    it (ARCHITECTURE.md B2 operation 6); a channel `get_channel_status` marks
-    "closed" is never returned here, regardless of how favorably it's scored.
+    not permanently closed by the Circuit Breaker (B4). The Bandit chooses only
+    among whatever the Circuit Breaker still permits — it never overrules it
+    (ARCHITECTURE.md B2 operation 6); a dead channel is never returned here,
+    regardless of how favorably it's scored.
 
-    Returns an empty list if every registered channel is currently closed —
-    that's the Orchestrator's (D1) signal to route to Human Fallback (B5)
-    instead of calling the Bandit at all (see `circuit_breaker.all_channels_closed`).
+    "Permanently closed" (`circuit_breaker.is_channel_permanently_closed`) is the
+    right test here rather than "closed right now" (`is_channel_open`), and the
+    distinction matters: card's 24h soft-decline spacing rule is a *wait*, not a
+    wall. Treating a channel that is merely serving out its spacing window as
+    unavailable would make a card-only customer look like they had no options left
+    and escalate them to a human without a single retry. Instead the arm stays
+    selectable, and the Orchestrator (D1) simply doesn't fire the attempt until
+    `circuit_breaker.earliest_next_attempt_at` permits it — so the rule is still
+    obeyed exactly, just as a delay rather than a dead end. `now` is retained in
+    the signature for that reason: callers reason about the same instant B4 does.
+
+    `pending_decline` carries the original billing-event failure, which by this
+    project's convention is not itself an attempt record — see
+    `circuit_breaker.PendingDecline`. Without it, a channel that hard-declined on
+    the original charge would still look available on the very first round.
+
+    Returns an empty list if every registered channel is permanently closed —
+    that's the Orchestrator's signal to route to Human Fallback (B5) instead of
+    calling the Bandit at all (see `circuit_breaker.all_channels_permanently_closed`).
     """
-    registered = _ordered_registered_channels(customer)
-    status = circuit_breaker.get_channel_status(transaction, registered, now)
-    return [channel for channel in registered if status[channel] == "open"]
+    del now  # see docstring: availability is the permanent-closure question
+    return [
+        channel
+        for channel in _ordered_registered_channels(customer)
+        if not circuit_breaker.is_channel_permanently_closed(
+            transaction, channel, pending_decline
+        )
+    ]
 
 
 def select_arm(

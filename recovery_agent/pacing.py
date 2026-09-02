@@ -12,10 +12,44 @@ import random
 from collections import deque
 from dataclasses import dataclass
 
-SUCCESS_RATE_THRESHOLD = 0.9
-"""The "healthy system" line AIMD reacts to (ARCHITECTURE.md B3, operations
-4–5: "~90%"). At or above this, the rolling success rate counts as healthy
-and aggressiveness nudges up; below it, aggressiveness gets cut sharply."""
+DEGRADATION_FRACTION = 0.25
+"""How much worse than our own norm the recent window has to be before AIMD
+treats the system as degraded and backs off sharply.
+
+**This replaces a fixed ~90% success-rate threshold, and the reason is worth
+recording.** ARCHITECTURE.md B3 (operations 4–5) and IDEA.md §8b both name
+"~90%" as the healthy line, borrowed directly from TCP congestion control.
+That number is right in its home field, where virtually every packet arrives,
+and wrong here: this system retries payments that have *already failed once*,
+where an end-to-end batch success rate around 30% is a good day. A fixed 90%
+line can therefore never be met, so additive increase would never fire, and
+the dial would ratchet down to `MIN_AGGRESSIVENESS` on the first bad patch and
+stay pinned there for the rest of the run — leaving a mechanism IDEA.md §12
+calls load-bearing looking active while actually behaving as a constant ~48h
+wait. This was caught by the Phase 8 end-to-end run, not by any unit test,
+because it only shows up once real attempt volume flows through.
+
+The fix keeps AIMD's shape and drops the borrowed constant: "healthy" is now
+measured **against the system's own running baseline** rather than an absolute
+number, so it self-calibrates to whatever success rate this population
+actually produces. See `is_degraded` for the rule itself.
+
+The specific fraction (25% worse than baseline) is our own choice, not a
+borrowed figure, and should be described that way in any write-up. It is
+deliberately a *relative* band so it stays meaningful whether the baseline
+settles at 30% or 60%.
+"""
+
+MIN_SAMPLES_FOR_AIMD = 10
+"""How many attempts must be on record before AIMD moves the dial at all.
+
+Below this, recent and baseline are computed from nearly the same handful of
+attempts, so comparing them says nothing — and acting on that noise would
+swing the dial hardest exactly when the system knows least. Under this count
+AIMD holds steady instead, which is the honest response to "not enough
+evidence yet" and matches the same stance `RollingOutcomeWindow.success_rate`
+and `bandit.ArmStats.success_rate` already take for an empty sample.
+"""
 
 ADDITIVE_INCREASE_STEP = 0.05
 """How much aggressiveness rises on a single healthy update — deliberately
@@ -91,17 +125,51 @@ class RollingOutcomeWindow:
 
     def __init__(self, maxlen: int = 50) -> None:
         self._outcomes: deque[bool] = deque(maxlen=maxlen)
+        # Lifetime totals, kept alongside the rolling window rather than in a
+        # second object: AIMD compares "how are we doing lately?" against "how
+        # do we normally do?", and both halves of that question are answered by
+        # the same stream of outcomes. Two counters are enough — there is no
+        # need to retain every outcome ever seen just to hold an average.
+        self._total_attempts = 0
+        self._total_successes = 0
 
     def record(self, success: bool) -> None:
         """Append one attempt's outcome. Once the window is full (`maxlen`
         reached), each new outcome silently evicts the oldest one — the
         `deque(maxlen=...)` behavior that makes this a *rolling* window
-        rather than an ever-growing log.
+        rather than an ever-growing log. The lifetime totals behind
+        `baseline_success_rate` keep counting regardless of that eviction.
         """
         self._outcomes.append(success)
+        self._total_attempts += 1
+        self._total_successes += int(success)
 
     def __len__(self) -> int:
         return len(self._outcomes)
+
+    @property
+    def total_attempts(self) -> int:
+        """Every attempt ever recorded in this batch run, including ones that
+        have already rolled out of the window."""
+        return self._total_attempts
+
+    @property
+    def baseline_success_rate(self) -> float:
+        """The success rate across the *whole run so far* — "how do we normally
+        do?" — as opposed to `success_rate`, which is "how are we doing lately?".
+
+        This is what makes AIMD self-calibrating (see `DEGRADATION_FRACTION`):
+        rather than measuring health against a borrowed constant that this
+        domain can never reach, the system measures itself against its own
+        track record, whatever success rate that turns out to be.
+
+        Returns `1.0` on an empty run, matching `success_rate`'s neutral stance
+        — though with no attempts recorded, `MIN_SAMPLES_FOR_AIMD` means AIMD
+        will not be acting on this value anyway.
+        """
+        if self._total_attempts == 0:
+            return 1.0
+        return self._total_successes / self._total_attempts
 
     @property
     def success_rate(self) -> float:
@@ -117,6 +185,66 @@ class RollingOutcomeWindow:
         if not self._outcomes:
             return 1.0
         return sum(self._outcomes) / len(self._outcomes)
+
+
+SIGNAL_WARMING_UP = "warming_up"
+SIGNAL_HEALTHY = "healthy"
+SIGNAL_DEGRADED = "degraded"
+"""The three things AIMD can conclude on a given round, named so the Audit
+Trail (C1) can say which one drove a wait time without re-deriving it."""
+
+
+def is_degraded(
+    recent_success_rate: float, baseline_success_rate: float, sample_count: int
+) -> bool:
+    """The rule AIMD's multiplicative decrease fires on: is the system doing
+    *meaningfully worse than it normally does*?
+
+    Kept as a plain function over three numbers, rather than folded into
+    `AimdState.update`, so the rule can be reasoned about and tested on its own
+    without constructing a window or a dial.
+
+    Two details matter, and both exist to protect AIMD's deliberately lopsided
+    shape (a small `ADDITIVE_INCREASE_STEP` up, a hard
+    `MULTIPLICATIVE_DECREASE_FACTOR` cut down):
+
+    - The test is "worse than baseline **by a margin**" (`DEGRADATION_FRACTION`),
+      not simply "below baseline." Recent performance sits below its own average
+      roughly half the time by definition, so treating that as degraded would
+      fire the sharp cut on half of all rounds and collapse the dial to its floor
+      — the exact failure the fixed 90% threshold caused, arriving by a different
+      route. Backing off has to be the *exception*, the way a dropped packet is
+      in TCP, or AIMD stops being AIMD.
+    - A baseline of zero with enough evidence counts as degraded. If nothing at
+      all is working system-wide, "no deterioration from a norm of zero" is
+      technically true and practically absurd; slow down.
+
+    Below `MIN_SAMPLES_FOR_AIMD` this returns False (not degraded) — but callers
+    should be using `pacing_signal` and holding the dial steady instead of
+    reading that as a healthy signal.
+    """
+    if sample_count < MIN_SAMPLES_FOR_AIMD:
+        return False
+    if baseline_success_rate <= 0.0:
+        return True
+    return recent_success_rate < baseline_success_rate * (1.0 - DEGRADATION_FRACTION)
+
+
+def pacing_signal(window: "RollingOutcomeWindow") -> str:
+    """What the system's recent behavior says about its health right now —
+    one of `SIGNAL_WARMING_UP`, `SIGNAL_HEALTHY`, or `SIGNAL_DEGRADED`.
+
+    Separate from `AimdState.update` so a caller (the Orchestrator, and later
+    the Audit Trail) can record *why* a wait came out the way it did without
+    the act of asking changing the dial.
+    """
+    if window.total_attempts < MIN_SAMPLES_FOR_AIMD:
+        return SIGNAL_WARMING_UP
+    if is_degraded(
+        window.success_rate, window.baseline_success_rate, window.total_attempts
+    ):
+        return SIGNAL_DEGRADED
+    return SIGNAL_HEALTHY
 
 
 @dataclass
@@ -139,25 +267,41 @@ class AimdState:
 
     aggressiveness: float = INITIAL_AGGRESSIVENESS
 
-    def update(self, success_rate: float) -> float:
-        """Apply one AIMD adjustment step given the current rolling success
-        rate (`RollingOutcomeWindow.success_rate`), and return the new
-        aggressiveness level.
+    def update(self, window: "RollingOutcomeWindow") -> float:
+        """Apply one AIMD adjustment step from the system's current outcome
+        history, and return the new aggressiveness level.
 
-        At or above `SUCCESS_RATE_THRESHOLD`, this is "additive increase":
-        aggressiveness rises by a small fixed `ADDITIVE_INCREASE_STEP`,
-        capped at `MAX_AGGRESSIVENESS` — a sustained healthy run nudges the
-        system to retry a little sooner each time, gradually.
+        Takes the whole `RollingOutcomeWindow` rather than a single success
+        rate because the decision needs both halves of the comparison: how the
+        system is doing *lately* (`success_rate`) versus how it does
+        *normally* (`baseline_success_rate`). See `DEGRADATION_FRACTION` for
+        why health is measured against the system's own baseline instead of the
+        fixed ~90% line this originally used.
 
-        Below the threshold, this is "multiplicative decrease":
-        aggressiveness is cut to `MULTIPLICATIVE_DECREASE_FACTOR` of its
-        current value, floored at `MIN_AGGRESSIVENESS` — a single bad patch
-        (or a whole cluster of failures, since both show up the same way in
-        a rolling success rate that's dropped below 90%) costs far more
-        than one healthy update earns back, which is what makes AIMD
-        fast-to-back-off and slow-to-recover by design, not an accident.
+        Three outcomes, per `pacing_signal`:
+
+        - **Warming up** — too few attempts on record to compare anything, so
+          the dial holds steady. Acting on two or three data points would swing
+          it hardest exactly when the system knows least.
+        - **Healthy** — the normal case, and deliberately so: aggressiveness
+          rises by a small fixed `ADDITIVE_INCREASE_STEP`, capped at
+          `MAX_AGGRESSIVENESS`. A sustained good run nudges the system to retry
+          a little sooner each time, gradually.
+        - **Degraded** — recent results are meaningfully worse than this
+          system's own norm (or nothing is working at all). Aggressiveness is
+          cut to `MULTIPLICATIVE_DECREASE_FACTOR` of its current value, floored
+          at `MIN_AGGRESSIVENESS`.
+
+        The asymmetry is the whole point: one bad patch costs far more than one
+        good round earns back, so the system is fast to back off and slow to
+        recover — by design, not by accident. That only works while "healthy" is
+        the common case, which is exactly what measuring against a self-
+        calibrating baseline (rather than an unreachable constant) restores.
         """
-        if success_rate >= SUCCESS_RATE_THRESHOLD:
+        signal = pacing_signal(window)
+        if signal == SIGNAL_WARMING_UP:
+            return self.aggressiveness
+        if signal == SIGNAL_HEALTHY:
             self.aggressiveness = min(
                 self.aggressiveness + ADDITIVE_INCREASE_STEP, MAX_AGGRESSIVENESS
             )
