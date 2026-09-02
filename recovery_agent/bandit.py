@@ -125,19 +125,16 @@ class BanditStatsPool:
 
 
 def _ordered_registered_channels(customer: Customer) -> list[MandateChannel]:
-    """This customer's registered channels, in the order they were registered
-    (so the primary channel — see `Customer.primary_channel()` — always sorts
-    first), with duplicates dropped. `Customer.registered_channels()` returns a
-    plain `set`, which has no stable order; the Bandit needs a deterministic
-    ordering so arm selection is reproducible for a given seed.
+    """This customer's registered channels in registration order (primary first).
+
+    Delegates to `Customer.ordered_channels()`, which is where this ordering now lives:
+    the Simulator needs exactly the same guarantee for its own seeded draws, and two
+    copies of "the deterministic channel order" is precisely the kind of duplication
+    that lets one of them quietly drift. Kept as a named function here because the
+    Bandit's reason for wanting it — reproducible arm ordering, so a tie between arms
+    breaks the same way on every run of a seed — is worth stating at the point of use.
     """
-    seen: set[MandateChannel] = set()
-    ordered: list[MandateChannel] = []
-    for mandate in customer.mandates:
-        if mandate.channel not in seen:
-            seen.add(mandate.channel)
-            ordered.append(mandate.channel)
-    return ordered
+    return customer.ordered_channels()
 
 
 def available_arms(

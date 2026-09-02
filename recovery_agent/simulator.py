@@ -256,7 +256,11 @@ class Simulator:
             customer = self._customers_by_id[event.customer_id]
             category = self.first_attempt_category[event.billing_event_id]
             primary = customer.primary_channel()
-            other_channels = [c for c in customer.registered_channels() if c != primary]
+            # Registration order, never `registered_channels()` — this list is drawn
+            # from by the seeded RNG below, and a set's iteration order is not stable
+            # across processes, which silently unseeded the Hidden Truth (see
+            # `Customer.ordered_channels`).
+            other_channels = [c for c in customer.ordered_channels() if c != primary]
 
             if category == DeclineCategory.HARD:
                 # A hard decline means the primary channel itself is permanently

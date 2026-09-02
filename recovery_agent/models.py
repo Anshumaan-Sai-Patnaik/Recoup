@@ -79,7 +79,39 @@ class Customer(BaseModel):
     billing_cycle_days: int = 30
 
     def registered_channels(self) -> set[MandateChannel]:
+        """The set of channels this customer has on file — for membership tests only.
+
+        A `set` has no stable iteration order across processes (Python randomizes string
+        hashing per run), so anything that *iterates* this — especially anything that
+        then draws from the result with a seeded RNG — silently loses seeded
+        reproducibility. Use `ordered_channels()` for that. See its docstring for the
+        bug this cost us.
+        """
         return {m.channel for m in self.mandates}
+
+    def ordered_channels(self) -> list[MandateChannel]:
+        """This customer's channels in registration order (primary first), deduplicated.
+
+        The deterministic counterpart to `registered_channels()`, and the one every
+        caller that iterates, samples or chooses should use.
+
+        This exists because iterating the set version cost us a real bug, found during
+        Phase 10: the Simulator built each failed event's list of alternative channels by
+        iterating `registered_channels()`, then drew the genuinely-recoverable one from
+        that list with its seeded RNG. The draw was seeded and reproducible; the *order
+        it drew from* was not. So the Hidden Truth answer key — which channel would have
+        worked — differed between two runs of the same seed in different processes, and
+        with it the Smart Agent's recovery numbers. Within a single process both agents
+        still saw one identical world, which is why the Phase 9 comparison stayed valid
+        and why the problem stayed invisible until an audit trail was diffed across runs.
+        """
+        seen: set[MandateChannel] = set()
+        ordered: list[MandateChannel] = []
+        for mandate in self.mandates:
+            if mandate.channel not in seen:
+                seen.add(mandate.channel)
+                ordered.append(mandate.channel)
+        return ordered
 
     def primary_channel(self) -> MandateChannel:
         """The customer's first-registered channel — always the one charged on a
@@ -152,15 +184,21 @@ class DeclineCodeRegistry:
     """
 
     _cache: dict[MandateChannel, dict[str, DeclineCategory]] = {}
+    _raw_cache: dict[MandateChannel, dict[str, dict[str, str]]] = {}
+
+    @classmethod
+    def _load_raw(cls, channel: MandateChannel) -> dict[str, dict[str, str]]:
+        if channel not in cls._raw_cache:
+            path = _DECLINE_CODES_DIR / f"{channel.value}.json"
+            cls._raw_cache[channel] = json.loads(path.read_text(encoding="utf-8"))["codes"]
+        return cls._raw_cache[channel]
 
     @classmethod
     def _load_channel(cls, channel: MandateChannel) -> dict[str, DeclineCategory]:
         if channel not in cls._cache:
-            path = _DECLINE_CODES_DIR / f"{channel.value}.json"
-            raw = json.loads(path.read_text(encoding="utf-8"))
             cls._cache[channel] = {
                 code: DeclineCategory(entry["category"])
-                for code, entry in raw["codes"].items()
+                for code, entry in cls._load_raw(channel).items()
             }
         return cls._cache[channel]
 
@@ -170,6 +208,22 @@ class DeclineCodeRegistry:
         recognized code — callers (e.g. the Classifier, B1) must handle None by
         flagging the pair explicitly rather than guessing a category."""
         return cls._load_channel(channel).get(code)
+
+    @classmethod
+    def describe(cls, channel: MandateChannel, code: str) -> Optional[str]:
+        """The registry's own short human description of a code (e.g. `"51"` ->
+        `"Insufficient funds"`), or None if the pair isn't recognized.
+
+        Added for the Audit Trail (C1), which has to write a sentence a non-engineer can
+        read: "declined with code 51 (insufficient funds)" is the same fact as "declined
+        with code 51", stated in language a merchant understands. It is a *lookup in
+        reference data*, not an interpretation — exactly like `lookup` — which is why it
+        belongs here in A1 rather than as a table of prose inside C1. Returning None for
+        an unknown code keeps the same honesty contract: the caller flags it, nobody
+        guesses.
+        """
+        entry = cls._load_raw(channel).get(code)
+        return entry.get("description") if entry else None
 
     @classmethod
     def is_known(cls, channel: MandateChannel, code: str) -> bool:

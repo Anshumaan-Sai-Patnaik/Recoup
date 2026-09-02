@@ -130,6 +130,17 @@ class SmartAgentRuntime:
         return cls(rng=random.Random(config.seed))
 
 
+ATTEMPT_DECISION_EVENT_TYPE = "attempt_decision"
+"""The `event_type` tag every per-attempt record this component emits carries.
+
+Tagged at the source, following the convention
+`human_fallback.HUMAN_FALLBACK_EVENT_TYPE` set: the Audit Trail (C1) collects raw events
+from several components and picks a renderer per type, and letting it guess from an
+event's shape would be both slower and more fragile than each component simply saying
+what it produced.
+"""
+
+
 @dataclass(frozen=True)
 class AttemptDecision:
     """One round of the loop, recorded as facts.
@@ -168,12 +179,13 @@ class AttemptDecision:
     decline_code: Optional[str] = None
     decline_category: Optional[DeclineCategory] = None
     unrecognized_decline_code: bool = False
+    event_type: str = ATTEMPT_DECISION_EVENT_TYPE
 
     def to_dict(self) -> dict[str, Any]:
         """A flat, JSON/CSV-friendly row, so C1's `pandas` export (ARCHITECTURE.md C1
         operation 4) needs no per-event special-casing."""
         return {
-            "event_type": "attempt_decision",
+            "event_type": self.event_type,
             "transaction_id": self.transaction_id,
             "attempt_number": self.attempt_number,
             "decided_at": self.decided_at.isoformat(),
