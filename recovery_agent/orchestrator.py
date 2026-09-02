@@ -20,13 +20,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
-from recovery_agent import circuit_breaker, pacing
+from recovery_agent import bandit, circuit_breaker, pacing
 from recovery_agent.bandit import (
     BanditContext,
     BanditStatsPool,
     available_arms,
     context_key,
-    select_arm,
+    select_arm_with_mode,
 )
 from recovery_agent.classifier import UnrecognizedDeclineCodeError, classify
 from recovery_agent.human_fallback import (
@@ -179,6 +179,15 @@ class AttemptDecision:
     decline_code: Optional[str] = None
     decline_category: Optional[DeclineCategory] = None
     unrecognized_decline_code: bool = False
+    selection_mode: str = bandit.SELECTION_EXPLOIT
+    """Which half of epsilon-greedy chose `chosen_channel` — `"exploit"` (the best
+    observed record in this context) or `"explore"` (a deliberate random draw).
+
+    Recorded because C1 has to describe the choice in English and the two are different
+    reasons. Not derivable after the fact: an exploration can land on the same arm an
+    exploit would have picked, so only the Bandit itself knows which happened.
+    """
+
     event_type: str = ATTEMPT_DECISION_EVENT_TYPE
 
     def to_dict(self) -> dict[str, Any]:
@@ -195,6 +204,7 @@ class AttemptDecision:
             "available_arms": ",".join(c.value for c in self.available_arms),
             "chosen_channel": self.chosen_channel.value,
             "chosen_arm": self.chosen_arm,
+            "selection_mode": self.selection_mode,
             "rolling_success_rate": self.rolling_success_rate,
             "baseline_success_rate": self.baseline_success_rate,
             "health_signal": self.health_signal,
@@ -310,8 +320,17 @@ def run_transaction(
         # We cannot diagnose the failure we are supposed to be recovering from, so we
         # do not start guessing with someone's money — a human takes it from here. See
         # the same branch inside the loop below for the full reasoning.
+        #
+        # `closed_channels` is **empty**, and that is the honest value: the Circuit
+        # Breaker closed nothing here. The loop stopped because B1 declined to
+        # classify the code, not because anything was ruled out. This used to pass
+        # `registered`, which read naturally but made the audit trail say the breaker
+        # had permanently closed every channel on file — a safety mechanism credited
+        # with a decision it never made (found in Phase 10 task 5; see notes/TRACKER.md).
+        # The reason this transaction stopped travels on its closing line instead,
+        # where the `unrecognized_decline_code` tag actually is.
         result.human_fallback_event = run_human_fallback(
-            transaction, clock.now(), merchant, closed_channels=registered
+            transaction, clock.now(), merchant, closed_channels=[]
         )
         result.terminal_reason = "unrecognized_decline_code"
         return result
@@ -381,7 +400,7 @@ def run_transaction(
         context: BanditContext = context_key(
             context_decline.channel, context_decline.category
         )
-        chosen = select_arm(
+        chosen, selection_mode = select_arm_with_mode(
             arms, context, runtime.stats_pool, runtime.rng, epsilon=config.epsilon
         )
 
@@ -473,6 +492,7 @@ def run_transaction(
                 available_arms=tuple(arms),
                 chosen_channel=chosen,
                 chosen_arm=_arm_label(chosen, context_decline.channel),
+                selection_mode=selection_mode,
                 rolling_success_rate=rolling_success_rate,
                 baseline_success_rate=baseline_success_rate,
                 health_signal=health_signal,

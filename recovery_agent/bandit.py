@@ -212,11 +212,46 @@ def select_arm(
     Fallback (B5) instead of calling the Bandit at all; it is not a case this
     function is meant to handle.
     """
+    arm, _mode = select_arm_with_mode(
+        available_arms, context, stats_pool, rng, epsilon=epsilon
+    )
+    return arm
+
+
+SELECTION_EXPLOIT = "exploit"
+SELECTION_EXPLORE = "explore"
+"""Which half of epsilon-greedy produced a choice.
+
+Recorded rather than left implicit because the Audit Trail (C1) has to describe the
+choice in English, and the two halves are genuinely different reasons: an exploit picked
+the arm with the best observed record; an explore picked uniformly at random *on
+purpose*, to keep gathering evidence on arms it knows less about. A log that described
+every choice as "going on what has worked before" would be asserting a mechanism that
+was not the one used roughly `epsilon` of the time — exactly the kind of unconfirmed
+claim ARCHITECTURE.md C1 operation 5 forbids.
+"""
+
+
+def select_arm_with_mode(
+    available_arms: list[MandateChannel],
+    context: BanditContext,
+    stats_pool: BanditStatsPool,
+    rng: random.Random,
+    epsilon: float = DEFAULT_EPSILON,
+) -> tuple[MandateChannel, str]:
+    """`select_arm`, but also reporting *which* half of epsilon-greedy chose the arm.
+
+    The whole selection rule lives here and `select_arm` is a thin wrapper over it, so
+    there is one implementation rather than two that could drift. Callers that only need
+    the arm (including B2's own tests) keep the simpler signature; the Orchestrator uses
+    this one, because the audit trail has to say why the arm was picked and only this
+    function knows.
+    """
     if not available_arms:
         raise ValueError("select_arm requires at least one available arm")
 
     if rng.random() < epsilon:
-        return rng.choice(available_arms)
+        return rng.choice(available_arms), SELECTION_EXPLORE
 
     best_arm = available_arms[0]
     best_rate = stats_pool.get_stats(context, best_arm).success_rate
@@ -225,4 +260,4 @@ def select_arm(
         if rate > best_rate:
             best_arm = arm
             best_rate = rate
-    return best_arm
+    return best_arm, SELECTION_EXPLOIT

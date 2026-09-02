@@ -7,12 +7,12 @@ polish — and IDEA.md §10 is the reason: every money-related action needs a sp
 human-readable reason attached to it.
 
 This file is built in the order C1's five operations are written, and currently covers
-operations 1-3: **collect** the structured decision events the decision components
+operations 1-4: **collect** the structured decision events the decision components
 already emit and hold them as one ordered, queryable trail (operation 1); **render**
-each one into the plain-English sentence IDEA.md §10 asks for (operation 2); and serve
+each one into the plain-English sentence IDEA.md §10 asks for (operation 2); serve
 that back per transaction and across a whole batch, timestamped in simulated time
-(operation 3). The `pandas` export (operation 4) is added on top of the same rows
-without changing them.
+(operation 3); and **export** the whole log, or any slice of it, to CSV/JSON via
+`pandas` (operation 4) — built on top of exactly the same rows, changing none of them.
 
 Collection and rendering are kept strictly apart: the trail stores the original event
 objects and the English is generated from them on demand, so a sentence can never drift
@@ -38,13 +38,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional, Union
+
+import pandas as pd
 
 from recovery_agent.baseline_agent import (
     BaselineAttemptDecision,
     BaselineTransactionResult,
 )
-from recovery_agent import pacing
+from recovery_agent import bandit, pacing
 from recovery_agent.human_fallback import HumanFallbackEvent
 from recovery_agent.models import (
     AttemptOutcome,
@@ -268,6 +271,12 @@ class AuditEntry:
 # The four event types get four genuinely different sentences rather than one template
 # with blanks, because the agents did genuinely different things and describing the
 # naive one in the smart one's vocabulary would flatter it.
+#
+# Every rendered sentence is **pure ASCII**, for the same reason B5's nudge message is
+# (see `human_fallback.NUDGE_MESSAGE_TEMPLATE`): a live demo that prints a line to a
+# Windows console inherits a cp1252 encoding that raises on an em dash. The exported
+# files are UTF-8 and would carry one happily, but the console is where this log gets
+# read out loud, and a `UnicodeEncodeError` mid-demo is a bad way to find that out.
 # ---------------------------------------------------------------------------
 
 _CHANNEL_NAMES: dict[MandateChannel, str] = {
@@ -397,12 +406,31 @@ def _render_attempt_decision(event: AttemptDecision) -> str:
         )
     if len(event.available_arms) == 1:
         reasons.append(f"{chosen} is the only channel it is still allowed to try")
+    elif event.selection_mode == bandit.SELECTION_EXPLORE:
+        # Epsilon-greedy explores a fixed fraction of the time, picking uniformly at
+        # random rather than by record. Describing that as "going on what has worked
+        # before" would credit the choice to evidence it did not use — the exact class
+        # of unconfirmed claim C1 operation 5 forbids. The event carries which half ran
+        # (`selection_mode`) precisely so this sentence doesn't have to assume.
+        reasons.append(
+            f"the bandit picked it at random from the {len(event.available_arms)} "
+            f"channels still allowed ({_channel_list(event.available_arms)}) as a "
+            "deliberate exploration step, so it keeps gathering evidence on options it "
+            "has tried less often"
+        )
     else:
+        # Stated as the rule that was applied rather than as a claim about the
+        # evidence, because this renderer cannot see the Bandit's pool: at cold start
+        # every arm scores 0.0 and the tie-break decides. Naming the tie-break makes
+        # the sentence true in that case too, instead of implying a track record that
+        # may not exist yet.
         reasons.append(
             f"the bandit chose it from the {len(event.available_arms)} channels still "
-            f"allowed ({_channel_list(event.available_arms)}), going on what has worked "
-            f"before after a {_category(event.context_category)} decline on "
-            f"{_channel(event.context_channel)}"
+            f"allowed ({_channel_list(event.available_arms)}) by its usual rule: the "
+            "best success rate on record after a "
+            f"{_category(event.context_category)} decline on "
+            f"{_channel(event.context_channel)}, ties going to the earliest-registered "
+            "channel"
         )
     # A channel the chosen one is *not* gets a plain "closed for now" note. The chosen
     # channel being closed at decision time is a different story and is told by the
@@ -458,7 +486,7 @@ def _render_outcome_clause(event: AttemptDecision) -> str:
     if event.unrecognized_decline_code or event.decline_category is None:
         return (
             f"The attempt was declined with code {event.decline_code}, which is not in "
-            "the decline-code registry — no soft/hard category is being claimed for it."
+            "the decline-code registry, so no soft/hard category is being claimed for it."
         )
     return (
         f"The attempt was declined with code "
@@ -481,7 +509,7 @@ def _render_baseline_attempt_decision(event: BaselineAttemptDecision) -> str:
         f"Attempt {event.attempt_number} of {event.attempt_cap} on "
         f"{event.transaction_id}: retrying via {_channel(event.chosen_channel)}, "
         f"{_duration(event.wait_hours)} after the last decline, because this agent "
-        "always retries the same channel on a fixed schedule — it did not look at the "
+        "always retries the same channel on a fixed schedule; it did not look at the "
         "decline code, consider any other payment method on file, or check any safety "
         "rule"
     )
@@ -517,7 +545,7 @@ def _render_human_fallback(event: HumanFallbackEvent, agent: str) -> str:
         )
     elif agent == AGENT_BASELINE:
         because = (
-            "because its fixed attempt cap ran out — no channel was ever checked, and "
+            "because its fixed attempt cap ran out; no channel was ever checked, and "
             "none was closed"
         )
     else:
@@ -539,7 +567,7 @@ def _render_transaction_outcome(event: TransactionOutcomeEvent) -> str:
         )
     return (
         f"Transaction {event.transaction_id} finished as {status} after "
-        f"{event.attempt_count} attempt{'s' if event.attempt_count != 1 else ''} — "
+        f"{event.attempt_count} attempt{'s' if event.attempt_count != 1 else ''}: "
         f"{reason}."
     )
 
@@ -582,6 +610,114 @@ def _agent_for(result: AgentResult) -> str:
         f"Cannot record an audit trail for {type(result).__name__!r}: expected an "
         "orchestrator.TransactionResult or a baseline_agent.BaselineTransactionResult."
     )
+
+
+# ---------------------------------------------------------------------------
+# Export (ARCHITECTURE.md C1, operation 4)
+#
+# "Support export of the full log (or a filtered slice) in a structured, downloadable
+# form — not just something visible transiently in a live view." IDEA.md §10 gives the
+# reason: the live narration is seen once, by whoever is in the room. A judge reviewing
+# the repo afterwards, or anyone who wants to check a claim we made on stage, needs the
+# same log as a file they can open, sort and grep on their own.
+#
+# There is no new rendering and no new fact here. An export is just `AuditEntry.to_dict`
+# run over a list of entries and handed to `pandas` — which is the whole reason every
+# event type was written to flatten itself back in Phases 3-9.
+# ---------------------------------------------------------------------------
+
+EXPORT_COLUMN_ORDER: tuple[str, ...] = (
+    # provenance the trail added
+    "sequence",
+    "agent",
+    "occurred_at",
+    "sentence",
+    # which record this is, and whose
+    "event_type",
+    "transaction_id",
+    "customer_id",
+    "merchant_id",
+    # where in the journey it sits
+    "attempt_number",
+    "attempt_cap",
+    "attempt_count",
+    # what the agent was reacting to
+    "context_channel",
+    "context_category",
+    "channel_status",
+    "closed_channels",
+    # what it chose
+    "available_arms",
+    "chosen_channel",
+    "chosen_arm",
+    "selection_mode",
+    # why it waited as long as it did
+    "rolling_success_rate",
+    "baseline_success_rate",
+    "health_signal",
+    "aggressiveness",
+    "base_wait_hours",
+    "jittered_wait_hours",
+    "actual_wait_hours",
+    "spacing_rule_applied",
+    # what happened
+    "decided_at",
+    "attempted_at",
+    "outcome",
+    "decline_code",
+    "decline_category",
+    "unrecognized_decline_code",
+    # how the journey ended
+    "status",
+    "terminal_reason",
+    "message",
+)
+"""The column order of an exported trail, fixed here rather than left to whatever order
+the first row happened to introduce its keys in.
+
+Two reasons it is spelled out. First, **reproducibility**: rows come from four different
+event types with overlapping-but-different fields, so a first-seen ordering would shift
+depending on which agent or which slice was exported — and an audit artefact whose
+columns move between two exports of the same run is a poor audit artefact. Second, it
+reads as the decision itself reads: who and when, the English sentence, then what the
+agent saw, what it chose, why it waited, what came back, and how the journey ended. A
+reader who doubts a sentence can walk left to right through the facts behind it.
+
+A key not listed here is not dropped — it is appended, alphabetically, after these. So
+adding a field to any event still lands in the export automatically; listing it here is
+only how it gets a considered *position*.
+"""
+
+
+def _ordered_columns(rows: Iterable[dict[str, Any]]) -> list[str]:
+    """The columns present in `rows`, in `EXPORT_COLUMN_ORDER`, with anything unlisted
+    appended alphabetically.
+
+    Only columns that actually occur are returned, so exporting a slice of one event
+    type gives a narrow, readable table rather than a wide one padded with empty
+    columns for events it doesn't contain.
+    """
+    present: set[str] = set()
+    for row in rows:
+        present.update(row)
+    known = [c for c in EXPORT_COLUMN_ORDER if c in present]
+    unknown = sorted(present.difference(EXPORT_COLUMN_ORDER))
+    return known + unknown
+
+
+def _write_text(path: Union[str, Path], text: str) -> None:
+    """Write an export to disk as UTF-8, with newlines left exactly as produced.
+
+    Both details are deliberate. UTF-8 is pinned because a run started from a Windows
+    console inherits a cp1252 default that would fail on the first non-ASCII character
+    in a merchant name. `newline=""` stops Python translating the line endings `pandas`
+    already chose, which would otherwise give a CSV doubled-up `
+
+` line breaks on
+    Windows and confuse some spreadsheet readers.
+    """
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        handle.write(text)
 
 
 @dataclass
@@ -689,7 +825,7 @@ class AuditTrail:
         """
         lines: list[str] = []
         for entry in self.for_transaction(transaction_id):
-            stamp = entry.occurred_at.isoformat(sep=" ") if entry.occurred_at else "—"
+            stamp = entry.occurred_at.isoformat(sep=" ") if entry.occurred_at else "--"
             lines.append(f"[{stamp}] {entry.sentence}")
         return lines
 
@@ -710,6 +846,79 @@ class AuditTrail:
             keyed.append((last_seen or datetime.min, entry.sequence, entry))
         keyed.sort(key=lambda item: (item[0], item[1]))
         return [entry for _, _, entry in keyed]
+
+    # -- Export (C1, operation 4) ------------------------------------------------
+
+    def to_rows(
+        self, entries: Optional[Iterable[AuditEntry]] = None
+    ) -> list[dict[str, Any]]:
+        """The trail (or a slice of it) as flat rows of primitives.
+
+        The shared step under every export below, and the seam the Dashboard (C4) can
+        also read directly if it wants a table without going through a file.
+        """
+        return [e.to_dict() for e in (self.entries if entries is None else entries)]
+
+    def to_frame(self, entries: Optional[Iterable[AuditEntry]] = None) -> pd.DataFrame:
+        """The trail (or a slice) as a `pandas.DataFrame`, in `EXPORT_COLUMN_ORDER`.
+
+        Built with `dtype=object` on purpose. The four event types carry different
+        fields, so most columns are absent from some rows; pandas' normal response is to
+        widen an integer column to float to make room for `NaN`, and an audit log
+        reporting "attempt 3.0" would be a small, avoidable way of looking untrustworthy.
+        Object dtype keeps every value exactly as its event emitted it and leaves the
+        gaps genuinely empty — which is the honest rendering anyway: a baseline row has
+        no `aggressiveness` because that agent has no pacing dial, not because the value
+        is zero or missing.
+
+        An empty trail returns an empty frame with no columns rather than raising —
+        exporting a run in which nothing happened is a legitimate, if dull, thing to do.
+        """
+        rows = self.to_rows(entries)
+        return pd.DataFrame(rows, columns=_ordered_columns(rows), dtype=object)
+
+    def to_csv(
+        self,
+        path: Optional[Union[str, Path]] = None,
+        entries: Optional[Iterable[AuditEntry]] = None,
+    ) -> str:
+        """Export as CSV text, and write it to `path` if one is given.
+
+        The text is returned either way, because the two consumers want different
+        things: a saved file for a judge reviewing the repo, and an in-memory string for
+        the Dashboard's `st.download_button` (DESIGN.md §3), which hands the browser
+        bytes rather than a path on the machine running the demo.
+
+        CSV is the format to open in a spreadsheet — one decision per row, the English
+        sentence in the fourth column, and the facts that justify it in the columns
+        beside it.
+        """
+        text = self.to_frame(entries).to_csv(index=False)
+        if path is not None:
+            _write_text(path, text)
+        return text
+
+    def to_json(
+        self,
+        path: Optional[Union[str, Path]] = None,
+        entries: Optional[Iterable[AuditEntry]] = None,
+        indent: int = 2,
+    ) -> str:
+        """Export as JSON text (a list of row objects), and write it to `path` if one is
+        given.
+
+        `orient="records"` is the shape a person expects — one object per decision,
+        keyed by column name — rather than pandas' column-major default, which is
+        compact but unreadable. Indented by default for the same reason: this artefact
+        exists to be read.
+
+        Missing fields come out as `null`, which is the JSON way of saying what the
+        blank CSV cell says: this agent never produced that fact.
+        """
+        text = self.to_frame(entries).to_json(orient="records", indent=indent)
+        if path is not None:
+            _write_text(path, text)
+        return text
 
 
 def collect_paired_run(
