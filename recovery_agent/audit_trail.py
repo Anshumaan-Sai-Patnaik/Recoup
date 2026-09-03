@@ -594,13 +594,17 @@ def render(event: AuditEvent, agent: str = AGENT_SMART) -> str:
     raise TypeError(f"No audit-trail renderer for {type(event).__name__!r}.")
 
 
-def _agent_for(result: AgentResult) -> str:
+def agent_for(result: AgentResult) -> str:
     """Which agent produced a result, read off its type.
 
     Inferred rather than passed in wherever possible, because the alternative — a caller
     labelling each batch by hand — is a mislabelling waiting to happen, and a head-to-
     head comparison whose two halves can be swapped by one wrong string argument is not
     a comparison anyone should trust.
+
+    Public rather than private because the Metrics engine (C3) labels the same two runs
+    and must label them the same way — a second copy of this mapping living over there
+    is exactly the kind of duplicate that drifts.
     """
     if isinstance(result, TransactionResult):
         return AGENT_SMART
@@ -705,7 +709,7 @@ def _ordered_columns(rows: Iterable[dict[str, Any]]) -> list[str]:
     return known + unknown
 
 
-def _write_text(path: Union[str, Path], text: str) -> None:
+def write_text(path: Union[str, Path], text: str) -> None:
     """Write an export to disk as UTF-8, with newlines left exactly as produced.
 
     Both details are deliberate. UTF-8 is pinned because a run started from a Windows
@@ -715,6 +719,9 @@ def _write_text(path: Union[str, Path], text: str) -> None:
 
 ` line breaks on
     Windows and confuse some spreadsheet readers.
+
+    Public because the Metrics engine (C3) exports files under exactly the same two
+    constraints, and a second copy of this convention is one that could drift.
     """
     with open(path, "w", encoding="utf-8", newline="") as handle:
         handle.write(text)
@@ -769,9 +776,9 @@ class AuditTrail:
         ended that way, then the derived closing line.
 
         `agent` is inferred from the result's type and should almost never be passed —
-        see `_agent_for`.
+        see `agent_for`.
         """
-        agent = agent or _agent_for(result)
+        agent = agent or agent_for(result)
         recorded = [self.record(decision, agent) for decision in result.decisions]
         if result.human_fallback_event is not None:
             recorded.append(self.record(result.human_fallback_event, agent))
@@ -895,7 +902,7 @@ class AuditTrail:
         """
         text = self.to_frame(entries).to_csv(index=False)
         if path is not None:
-            _write_text(path, text)
+            write_text(path, text)
         return text
 
     def to_json(
@@ -917,7 +924,7 @@ class AuditTrail:
         """
         text = self.to_frame(entries).to_json(orient="records", indent=indent)
         if path is not None:
-            _write_text(path, text)
+            write_text(path, text)
         return text
 
 

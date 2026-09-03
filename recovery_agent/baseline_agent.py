@@ -527,6 +527,18 @@ class PairedRun:
     smart: list[TransactionResult]
     baseline: list[BaselineTransactionResult]
 
+    orchestrator_config: OrchestratorConfig = field(default_factory=OrchestratorConfig)
+    baseline_config: "BaselineConfig" = field(default_factory=lambda: BaselineConfig())
+    """The *effective* agent configurations these results were produced with, resolved
+    to their defaults rather than left as `None`.
+
+    Carried on the run for the same reason `simulator_config` already is: the Metrics
+    engine (C3, operation 8) has to key a results object by everything that determined
+    the outcome, and a comparison stamped with a configuration supplied separately by
+    the caller is a citation nobody should trust. A seed alone does not identify a run
+    either — the same seed at a different failure rate is a different world.
+    """
+
 
 def run_paired_batch(
     simulator_config: SimulatorConfig,
@@ -563,6 +575,13 @@ def run_paired_batch(
     other's run, so `smart` and `baseline` could be computed in either order, or years
     apart, and be identical either way.
     """
+    # Resolved here rather than left to each agent's own `config or Default()` so that
+    # the run records the configuration it actually ran under, not the argument it was
+    # handed. Behaviourally identical; the difference is that the result can now say
+    # what produced it.
+    orchestrator_config = orchestrator_config or OrchestratorConfig()
+    baseline_config = baseline_config or BaselineConfig()
+
     smart_simulator = Simulator(simulator_config)
     baseline_simulator = Simulator(simulator_config)
 
@@ -571,4 +590,6 @@ def run_paired_batch(
         simulator=smart_simulator,
         smart=run_smart_batch(smart_simulator, config=orchestrator_config),
         baseline=run_batch(baseline_simulator, config=baseline_config),
+        orchestrator_config=orchestrator_config,
+        baseline_config=baseline_config,
     )

@@ -232,6 +232,28 @@ class TransactionResult:
     transaction: TransactionState
     decisions: list[AttemptDecision] = field(default_factory=list)
     human_fallback_event: Optional[HumanFallbackEvent] = None
+
+    origin_channel: Optional[MandateChannel] = None
+    origin_category: Optional[DeclineCategory] = None
+    origin_unrecognized: bool = False
+    """The Classifier's (B1) call on the **original billing-event failure** — the very
+    first diagnosis this journey turned on, recorded here because nothing else keeps it.
+
+    The original charge is deliberately not an `AttemptRecord` (the Phase 2 convention),
+    and while the opening diagnosis is normally visible as the first decision's
+    `context_category`, a transaction whose only channel is hard-declined escalates on
+    round 1 and emits **no decision at all** — 16% of a typical batch. Its opening call
+    would then exist nowhere, and the Metrics engine (C3, operation 7) would have to
+    re-run the Classifier to recover it. Re-running a decision to find out what it was
+    measures the measurer's copy of the rule rather than the run, so the component that
+    made the call records it instead. Same reasoning as
+    `AttemptDecision.selection_mode`: only the component that decided can honestly say
+    what it decided.
+
+    `origin_unrecognized` is `True` when B1 refused to classify the opening code, in
+    which case `origin_category` stays `None` rather than being filled with a guess.
+    """
+
     terminal_reason: str = ""
     """A short machine-readable tag for *why* the loop stopped — `"recovered"`,
     `"all_channels_closed"`, `"recovery_horizon_exceeded"`, `"max_attempts_reached"`,
@@ -329,6 +351,8 @@ def run_transaction(
         # with a decision it never made (found in Phase 10 task 5; see notes/TRACKER.md).
         # The reason this transaction stopped travels on its closing line instead,
         # where the `unrecognized_decline_code` tag actually is.
+        result.origin_channel = initial_channel
+        result.origin_unrecognized = True
         result.human_fallback_event = run_human_fallback(
             transaction, clock.now(), merchant, closed_channels=[]
         )
@@ -349,6 +373,8 @@ def run_transaction(
         category=initial_category,
         occurred_at=billing_event.scheduled_at,
     )
+    result.origin_channel = initial_channel
+    result.origin_category = initial_category
 
     # `context_decline` is whichever decline *this round* is reacting to — the original
     # failure on the first pass, then the most recent attempt's decline. It is what the
