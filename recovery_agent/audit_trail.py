@@ -314,6 +314,22 @@ is supposed to prevent.
 """
 
 
+def reason_phrase(terminal_reason: str) -> str:
+    """How a journey ended, in English, from its machine-readable reason tag.
+
+    Public because the Dashboard (C4) needs the same words when it breaks down *why*
+    recoverable payments got away, and two independent translations of the same tag would
+    eventually drift into saying two different things about one event. An unknown tag
+    comes back marked as raw and unrendered rather than paraphrased — the same refusal to
+    guess that governs every renderer in this file.
+    """
+    if not terminal_reason:
+        return "no reason tag was recorded"
+    return _REASON_PHRASES.get(
+        terminal_reason, f"recorded reason: {terminal_reason}"
+    )
+
+
 def _channel(channel: MandateChannel) -> str:
     return _CHANNEL_NAMES.get(channel, channel.value)
 
@@ -557,12 +573,7 @@ def _render_human_fallback(event: HumanFallbackEvent, agent: str) -> str:
 def _render_transaction_outcome(event: TransactionOutcomeEvent) -> str:
     """The closing line: how the journey ended, in the agent's own recorded terms."""
     status = _STATUS_PHRASES.get(event.status, event.status.value)
-    if not event.terminal_reason:
-        reason = "no reason tag was recorded"
-    else:
-        reason = _REASON_PHRASES.get(
-            event.terminal_reason, f"recorded reason: {event.terminal_reason}"
-        )
+    reason = reason_phrase(event.terminal_reason)
     return (
         f"Transaction {event.transaction_id} finished as {status} after "
         f"{event.attempt_count} attempt{'s' if event.attempt_count != 1 else ''}: "

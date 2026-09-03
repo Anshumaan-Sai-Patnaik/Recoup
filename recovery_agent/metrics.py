@@ -510,6 +510,17 @@ between two agents that both counted, which is exactly the wrong conclusion.
 """
 
 
+NOT_APPLICABLE_NO_CLASSIFIER = "not applicable (no classifier)"
+"""What an operation-7 cell says for an agent that never consults B1.
+
+The exact counterpart of `NOT_APPLICABLE_NO_BREAKER`, and it exists for the same reason:
+`AgainstTruth.classifier` is `None` for the Baseline because it never formed an opinion
+about *why* a payment failed — not because it formed one and scored zero. Rendering that
+absence as `0`, or as an empty cell a reader fills in themselves, would credit the Smart
+Agent with beating a diagnosis nobody ever made.
+"""
+
+
 def _cell(value: Any, summary: AgentSummary) -> Any:
     """Render one summary field for the comparison table."""
     if value is None:
