@@ -1,0 +1,18 @@
+# Streamlit configuration for the demo dashboard.
+#
+# The theme is pinned to light rather than left to follow the viewer's browser, for two
+# reasons. First, this is built to be shown on a projector in a lit room, where a dark
+# theme washes out. Second — and the reason it is worth a config file rather than a
+# preference — the chart colours in dashboard/app.py were validated for contrast and
+# colour-blind separation *against a specific surface colour*. A palette checked against a
+# light surface and then rendered on a dark one is no longer a checked palette. Pinning the
+# theme means the surface those colours were tested on is the surface they are drawn on.
+
+[theme]
+base = "light"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f4f4f2"
+textColor = "#0b0b0b"
+
+[browser]
+gatherUsageStats = false

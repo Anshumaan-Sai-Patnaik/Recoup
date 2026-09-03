@@ -44,6 +44,7 @@ from typing import Any, Iterable, Iterator, Optional, Union
 import pandas as pd
 
 from recovery_agent.baseline_agent import (
+    AgentResult,
     BaselineAttemptDecision,
     BaselineTransactionResult,
 )
@@ -146,9 +147,6 @@ each type into a *different* sentence, so a new event type has to be a considere
 addition here (and, next, in the renderer) rather than something that silently lands in
 the log with no sentence attached to it.
 """
-
-AgentResult = Union[TransactionResult, BaselineTransactionResult]
-
 
 def _event_timestamp(event: AuditEvent) -> Optional[datetime]:
     """When an event happened, in simulated time.

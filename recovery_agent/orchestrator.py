@@ -18,7 +18,7 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 from recovery_agent import bandit, circuit_breaker, pacing
 from recovery_agent.bandit import (
@@ -565,14 +565,14 @@ def run_transaction(
     return result
 
 
-def run_batch(
+def iter_batch(
     simulator: Simulator,
     runtime: Optional[SmartAgentRuntime] = None,
     config: Optional[OrchestratorConfig] = None,
-) -> list[TransactionResult]:
-    """Run the Smart Agent over every failed billing event in a seeded Simulator batch
-    (ARCHITECTURE.md D1, operation 12 — the Smart Agent half; the Baseline Agent's own
-    run over this identical batch arrives in Phase 9).
+) -> Iterator[TransactionResult]:
+    """Run the Smart Agent over every failed billing event in a seeded Simulator batch,
+    yielding each transaction the moment it finishes (ARCHITECTURE.md D1, operation 12 —
+    the Smart Agent half).
 
     Billing events that never failed are skipped: there is nothing to recover, and
     manufacturing a transaction for them would inflate the recovery rate the Metrics
@@ -581,6 +581,14 @@ def run_batch(
     One `SmartAgentRuntime` is shared across the whole batch on purpose — see that
     class's docstring — so the Bandit genuinely learns across customers and merchants,
     and AIMD genuinely reacts to system-wide health, as the batch progresses.
+
+    **Why this is a generator, and `run_batch` below is the thin wrapper.** The Dashboard
+    (C4, operation 1) narrates a batch *while it runs*, which a function that only
+    returns once every transaction is finished cannot support. Yielding per transaction
+    is the smallest change that gives the live feed something to watch, and it deliberately
+    does not give the caller a way to alter the run: a consumer can observe each result,
+    not steer the next one. The batch filter above stays in this one place, which matters
+    because both agents must apply it identically or their denominators stop matching.
     """
     config = config or OrchestratorConfig()
     runtime = runtime or SmartAgentRuntime.from_config(config)
@@ -588,13 +596,25 @@ def run_batch(
     customers_by_id = {c.customer_id: c for c in simulator.customers}
     merchants_by_id = {m.merchant_id: m for m in simulator.merchants}
 
-    results: list[TransactionResult] = []
     for billing_event in simulator.billing_events:
         if billing_event.billing_event_id not in simulator.failed_billing_event_ids:
             continue
         customer = customers_by_id[billing_event.customer_id]
         merchant = merchants_by_id[billing_event.merchant_id]
-        results.append(
-            run_transaction(simulator, billing_event, customer, merchant, runtime, config)
+        yield run_transaction(
+            simulator, billing_event, customer, merchant, runtime, config
         )
-    return results
+
+
+def run_batch(
+    simulator: Simulator,
+    runtime: Optional[SmartAgentRuntime] = None,
+    config: Optional[OrchestratorConfig] = None,
+) -> list[TransactionResult]:
+    """The whole batch, run to completion — `iter_batch` drained into a list.
+
+    Unchanged in behaviour and signature from the form every phase since Phase 8 has
+    called; the loop simply moved one function up so the Dashboard can also watch it
+    happen.
+    """
+    return list(iter_batch(simulator, runtime, config))

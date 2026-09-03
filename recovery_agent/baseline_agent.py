@@ -40,7 +40,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Optional
+from typing import Any, Generator, Iterator, Optional, Union
 
 from recovery_agent.human_fallback import (
     HumanFallbackEvent,
@@ -62,7 +62,7 @@ from recovery_agent.orchestrator import (
     OrchestratorConfig,
     TransactionResult,
 )
-from recovery_agent.orchestrator import run_batch as run_smart_batch
+from recovery_agent.orchestrator import iter_batch as iter_smart_batch
 from recovery_agent.simulator import SimulatedClock, Simulator, SimulatorConfig
 
 BASELINE_RETRY_INTERVAL_HOURS = 6.0
@@ -463,12 +463,13 @@ def run_transaction(
     return result
 
 
-def run_batch(
+def iter_batch(
     simulator: Simulator,
     config: Optional[BaselineConfig] = None,
-) -> list[BaselineTransactionResult]:
+) -> Iterator[BaselineTransactionResult]:
     """Run the Baseline Agent over every failed billing event in a seeded Simulator
-    batch (ARCHITECTURE.md C2; the mirror of `orchestrator.run_batch`).
+    batch, yielding each transaction as it finishes (ARCHITECTURE.md C2; the mirror of
+    `orchestrator.iter_batch`).
 
     Billing events that never failed are skipped, for the same reason the Orchestrator
     skips them: there is nothing to recover, and manufacturing a transaction for one
@@ -489,20 +490,35 @@ def run_batch(
     customers_by_id = {c.customer_id: c for c in simulator.customers}
     merchants_by_id = {m.merchant_id: m for m in simulator.merchants}
 
-    results: list[BaselineTransactionResult] = []
     for billing_event in simulator.billing_events:
         if billing_event.billing_event_id not in simulator.failed_billing_event_ids:
             continue
-        results.append(
-            run_transaction(
-                simulator,
-                billing_event,
-                customers_by_id[billing_event.customer_id],
-                merchants_by_id[billing_event.merchant_id],
-                config,
-            )
+        yield run_transaction(
+            simulator,
+            billing_event,
+            customers_by_id[billing_event.customer_id],
+            merchants_by_id[billing_event.merchant_id],
+            config,
         )
-    return results
+
+
+def run_batch(
+    simulator: Simulator,
+    config: Optional[BaselineConfig] = None,
+) -> list[BaselineTransactionResult]:
+    """The whole Baseline batch, run to completion — `iter_batch` drained into a list.
+    Unchanged in behaviour and signature; the mirror of `orchestrator.run_batch`."""
+    return list(iter_batch(simulator, config))
+
+
+AgentResult = Union[TransactionResult, BaselineTransactionResult]
+"""Either agent's per-transaction result — the two things a paired run produces.
+
+Defined here rather than in `audit_trail` (which is where it was first needed, and which
+re-exports it) because this is the lowest module that knows about both halves: it defines
+`BaselineTransactionResult` and imports `TransactionResult`. One definition, so a third
+agent could never be added to one copy and not the other.
+"""
 
 
 @dataclass(frozen=True)
@@ -540,13 +556,28 @@ class PairedRun:
     """
 
 
-def run_paired_batch(
+def iter_paired_batch(
     simulator_config: SimulatorConfig,
     orchestrator_config: Optional[OrchestratorConfig] = None,
     baseline_config: Optional[BaselineConfig] = None,
-) -> PairedRun:
-    """Run both agents over the same seeded world and return both results together
+) -> Generator[AgentResult, None, PairedRun]:
+    """Run both agents over the same seeded world, yielding each transaction as it
+    finishes and *returning* the assembled `PairedRun` when the run is over
     (ARCHITECTURE.md C2, operation 5; D1, operation 12).
+
+    **The two-value shape, and why it is one function rather than two.** The Dashboard
+    (C4) needs both halves of the same run: each finished transaction while the batch is
+    still going, to narrate live (operation 1), and the complete `PairedRun` at the end,
+    to hand to the Metrics engine (operations 2-3). Splitting those into a streaming
+    function and a separate re-run would run the world twice and invite the two copies to
+    disagree. A generator's return value carries the finished object out of the same
+    single pass — a consumer that only wants the end state calls `run_paired_batch`
+    below and never sees the stream at all.
+
+    Yielded results are *not* labelled with which agent produced them, deliberately:
+    `audit_trail.agent_for` already reads that off the result's type, and a second copy of
+    that mapping living here is exactly the kind of duplicate that drifts. (This module
+    cannot import `audit_trail` in any case — that module imports this one.)
 
     Everything that decides what the world *is* — which customers exist, which mandates
     they hold, which billing events fail, what the first decline code was, and the entire
@@ -585,11 +616,50 @@ def run_paired_batch(
     smart_simulator = Simulator(simulator_config)
     baseline_simulator = Simulator(simulator_config)
 
+    smart: list[TransactionResult] = []
+    for result in iter_smart_batch(smart_simulator, config=orchestrator_config):
+        smart.append(result)
+        yield result
+
+    baseline: list[BaselineTransactionResult] = []
+    for result in iter_batch(baseline_simulator, config=baseline_config):
+        baseline.append(result)
+        yield result
+
     return PairedRun(
         simulator_config=simulator_config,
         simulator=smart_simulator,
-        smart=run_smart_batch(smart_simulator, config=orchestrator_config),
-        baseline=run_batch(baseline_simulator, config=baseline_config),
+        smart=smart,
+        baseline=baseline,
         orchestrator_config=orchestrator_config,
         baseline_config=baseline_config,
     )
+
+
+def run_paired_batch(
+    simulator_config: SimulatorConfig,
+    orchestrator_config: Optional[OrchestratorConfig] = None,
+    baseline_config: Optional[BaselineConfig] = None,
+) -> PairedRun:
+    """Both agents' run over one identical seeded world, run to completion.
+
+    The form every phase since Phase 9 has called, and still the one to call unless you
+    specifically want to watch the batch happen. `iter_paired_batch` above holds the
+    reasoning about how the world is built; this drains it and hands back the object it
+    returns.
+
+    The loop below is the standard way to reach a generator's `return` value: iterating
+    it to exhaustion raises `StopIteration`, whose `value` is what the generator
+    returned. Results are dropped as they arrive because the generator is accumulating
+    them into the `PairedRun` regardless.
+    """
+    stream = iter_paired_batch(
+        simulator_config,
+        orchestrator_config=orchestrator_config,
+        baseline_config=baseline_config,
+    )
+    while True:
+        try:
+            next(stream)
+        except StopIteration as finished:
+            return finished.value
