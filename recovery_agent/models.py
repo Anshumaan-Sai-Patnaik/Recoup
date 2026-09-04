@@ -78,6 +78,20 @@ class Customer(BaseModel):
     mandates: list[MandateRegistration] = Field(min_length=1)
     billing_cycle_days: int = 30
 
+    billing_anniversary_offset_days: int = 0
+    """How far into the cycle this customer's own renewal day falls.
+
+    Real subscribers do not all renew on the same date — they renew on the anniversary of
+    whenever they happened to sign up. Two customers on the same 30-day cycle can
+    therefore be charged 19 days apart. Without this offset every customer in a batch
+    shares one renewal instant, which quietly made the Simulator's "mass failure" mode a
+    volume dial rather than the synchronisation it was documented as (the whole batch was
+    already synchronised). See notes/TRACKER.md, Phase 13.
+
+    Drawn once per customer by the Simulator from its seeded RNG, in
+    `[0, billing_cycle_days)`, and fixed thereafter.
+    """
+
     def registered_channels(self) -> set[MandateChannel]:
         """The set of channels this customer has on file — for membership tests only.
 

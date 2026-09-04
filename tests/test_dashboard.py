@@ -72,6 +72,27 @@ def app():
     return at
 
 
+@pytest.fixture(scope="module")
+def app_with_divergent_endings():
+    """A second, larger completed batch — the one test below needs a world where *both*
+    agents leave something behind, and for different reasons.
+
+    At 60 customers the Smart Agent recovers everything the answer key says was
+    recoverable, so only the Baseline contributes a stopping reason and the test it feeds
+    would pass vacuously. This is the smallest round population where the Smart Agent also
+    runs out of channels on at least one payment, which is the situation the test exists to
+    check the rendering of. Kept separate from `app` rather than replacing it, because the
+    other tests here are calibrated against that smaller world.
+    """
+    at = AppTest.from_file(str(APP), default_timeout=300)
+    at.run()
+    at.sidebar.slider("customers").set_value(200)
+    at.sidebar.slider("narration_delay").set_value(0.0)  # display only
+    at.sidebar.button[0].click().run()
+    assert not at.exception, at.exception
+    return at
+
+
 def _outcome_chart_spec(app):
     """The outcome chart's figure, as it was actually handed to the browser.
 
@@ -340,7 +361,9 @@ def test_classifier_numbers_are_never_shown_for_the_baseline(app):
         assert not any(character.isdigit() for character in cell)
 
 
-def test_a_reason_one_agent_cannot_record_is_not_shown_as_zero(app):
+def test_a_reason_one_agent_cannot_record_is_not_shown_as_zero(
+    app_with_divergent_endings,
+):
     """The two agents stop for different reasons, because they have different mechanisms.
 
     The Baseline can only ever end a journey at its fixed attempt cap; the Smart Agent can
@@ -349,7 +372,7 @@ def test_a_reason_one_agent_cannot_record_is_not_shown_as_zero(app):
     the ending does not exist for it — the same defect as a closure count of zero, in a
     place where it is much easier to miss.
     """
-    table = _diagnostic_table(app)
+    table = _diagnostic_table(app_with_divergent_endings)
     reason_rows = table.loc[table["Metric"].str.startswith("Missed because")]
     assert len(reason_rows) >= 2, (
         "expected each agent to have contributed at least one distinct stopping reason"
@@ -656,9 +679,8 @@ def test_mass_failure_forces_more_simultaneous_failures():
     and change the world, or it is a control that claims a mechanism the demo cannot
     produce.
 
-    What it verifiably changes is the *volume* of failures the pacing has to spread out —
-    a share of the population is forced to fail regardless of the base rate. What it does
-    not change is their timing; see the test below.
+    It changes two things, and before Phase 13 only the first was true: the *volume* of
+    failures the pacing has to spread out, and their *timing* — see the test below.
     """
     at = _fresh_app()
     at.sidebar.slider("customers").set_value(100)
@@ -680,37 +702,54 @@ def test_mass_failure_forces_more_simultaneous_failures():
     assert failures(storm) < len(storm.paired.simulator.billing_events)
 
 
-def test_every_charge_in_a_cycle_lands_on_one_instant():
-    """**This test pins a defect, not a feature.** It exists so that fixing the defect
-    breaks something loudly.
+def test_charges_spread_across_the_cycle_until_an_outage_synchronises_them():
+    """The fix for the defect a previous version of this test pinned.
 
-    `SimulatorConfig.mass_failure_scenario` and ARCHITECTURE.md A2 operation 10 both
-    describe that mode as forcing billing events "onto the exact same simulated instant",
-    a thundering-herd condition for Jitter (IDEA.md §8c) to spread out. It does — but they
-    were already there. Every customer is generated with the same `billing_cycle_days`, so
-    every charge in a cycle falls on one instant whether the mode is on or off, and the
-    spaced-out "normal batch" the mode is documented as contrasting against does not
-    exist here.
+    Every customer used to be generated with the same billing cycle *and* the same start
+    date, so every charge in a cycle landed on one simulated instant whether the
+    mass-failure mode was on or off — which made that mode a volume dial, while
+    `SimulatorConfig`, ARCHITECTURE.md A2 operation 10 and IDEA.md 8c all described it as
+    creating a synchronisation that was in fact always there.
 
-    If this assertion ever fails, somebody has staggered customers' billing anniversaries
-    — which is the right fix — and three things then need updating together: this test,
-    `SimulatorConfig.mass_failure_scenario`'s docstring, and the toggle's help text in
-    `dashboard/app.py`. Every recorded figure and run key in `notes/` also changes. The
-    decision is written up in `notes/TRACKER.md` under Phase 13.
+    Customers now renew on their own anniversary within the cycle
+    (`Customer.billing_anniversary_offset_days`), so both halves of that story are real:
+    a normal batch is spread out, and the outage genuinely piles a share of it onto one
+    instant. That is the condition Jitter exists for.
     """
     from collections import Counter
 
     at = _fresh_app()
     at.sidebar.slider("customers").set_value(60)
-    run = _run(at)
 
-    instants = Counter(
-        event.scheduled_at for event in run.paired.simulator.billing_events
+    at.sidebar.toggle("mass_failure").set_value(False)
+    calm = _run(at)
+    at.sidebar.toggle("mass_failure").set_value(True)
+    storm = _run(at)
+
+    def instants(run) -> Counter:
+        return Counter(e.scheduled_at for e in run.paired.simulator.billing_events)
+
+    calm_instants = instants(calm)
+    assert len(calm_instants) > 1, (
+        "a normal batch still lands on a single instant — the anniversary stagger is "
+        "not reaching the billing events"
     )
-    assert len(instants) == 1, (
-        "billing events are now spread across several instants — the simulator was "
-        "fixed, and the doc claims listed in this test's docstring need updating with it"
+    # Spread across the cycle, not merely across two days.
+    assert len(calm_instants) >= 10
+    assert max(calm_instants.values()) < len(calm.paired.simulator.billing_events) / 2, (
+        "no single day should hold half the batch when renewals are staggered"
     )
+
+    storm_instants = instants(storm)
+    biggest_calm_day = max(calm_instants.values())
+    biggest_storm_day = max(storm_instants.values())
+    assert biggest_storm_day > biggest_calm_day * 2, (
+        "the outage did not concentrate charges onto one instant, so the toggle is "
+        "still only a volume dial"
+    )
+    # The forced share lands together: a quarter of the batch on one instant is well
+    # beyond anything the stagger produces on its own.
+    assert biggest_storm_day >= len(storm.paired.simulator.billing_events) / 4
 
 
 def test_a_setting_that_cannot_change_the_outcome_does_not_change_the_key():

@@ -85,7 +85,11 @@ class SimulatorConfig:
     # fraction of customers' billing events to fail at the *same* simulated instant,
     # specifically to give the Pacing component's Jitter half (B3, Phase 6) a
     # thundering-herd condition to be tested against. Off by default; a normal batch
-    # run leaves each customer's billing event spaced out by their own cycle length.
+    # run spreads each customer's billing event across the cycle, on their own renewal
+    # anniversary (`Customer.billing_anniversary_offset_days`), so this mode genuinely
+    # changes *when* failures land and not merely how many there are. Until Phase 13
+    # that contrast was fiction — every customer shared one renewal instant, so the
+    # herd was always there and this toggle only made it bigger.
     mass_failure_scenario: bool = False
     mass_failure_fraction: float = 0.3
 
@@ -167,11 +171,16 @@ class Simulator:
                 MandateRegistration(channel=channel, registered_at=self.config.start_time)
                 for channel in channels
             ]
+            # Each customer renews on their own anniversary within the cycle, not on a
+            # date the whole population shares — see
+            # `Customer.billing_anniversary_offset_days`.
+            offset_days = self.rng.randrange(self.config.billing_cycle_days)
             customer = Customer(
                 customer_id=f"customer_{i + 1}",
                 merchant_id=merchant.merchant_id,
                 mandates=mandates,
                 billing_cycle_days=self.config.billing_cycle_days,
+                billing_anniversary_offset_days=offset_days,
             )
             self.customers.append(customer)
 
@@ -181,14 +190,21 @@ class Simulator:
         """ARCHITECTURE.md A2 operation 3 — one billing event per customer per
         configured cycle, each rolling independently whether it fails.
 
+        Normally each customer is charged on their own renewal anniversary within the
+        cycle (`Customer.billing_anniversary_offset_days`), so a batch's charges are
+        spread across the whole cycle rather than piled onto one instant.
+
         If `mass_failure_scenario` is enabled (operation 10), a configured fraction of
         customers are pre-selected (via the same seeded RNG, so it's still
         reproducible) to have their *first* cycle's billing event forced to fail and
-        forced onto the exact same simulated instant — a thundering-herd condition for
-        exercising the Pacing component's Jitter half later (Phase 6)."""
+        forced onto the exact same simulated instant, overriding their anniversary — a
+        thundering-herd condition for exercising the Pacing component's Jitter half
+        (Phase 6) against the spread-out normal batch."""
         mass_failure_customer_ids: set[str] = set()
+        # Mid-cycle: the outage lands in the middle of the window renewals are spread
+        # across, so the forced herd sits inside a normal batch rather than at its edge.
         mass_failure_instant = self.config.start_time + timedelta(
-            days=self.config.billing_cycle_days
+            days=self.config.billing_cycle_days * 1.5
         )
         if self.config.mass_failure_scenario:
             num_mass_failures = round(len(self.customers) * self.config.mass_failure_fraction)
@@ -205,7 +221,10 @@ class Simulator:
                     mass_failure_instant
                     if is_mass_failure
                     else self.config.start_time
-                    + timedelta(days=customer.billing_cycle_days * (cycle_index + 1))
+                    + timedelta(
+                        days=customer.billing_cycle_days * (cycle_index + 1)
+                        + customer.billing_anniversary_offset_days
+                    )
                 )
                 event = BillingEvent(
                     billing_event_id=event_id,
@@ -217,6 +236,18 @@ class Simulator:
                 self._billing_events_by_id[event_id] = event
                 if is_mass_failure or self.rng.random() < self.config.base_failure_rate:
                     self.failed_billing_event_ids.add(event_id)
+
+        # Chronological order, tie-broken by id so it stays deterministic. Both agents
+        # walk this one list (`orchestrator.iter_batch`, `baseline_agent.iter_batch`), so
+        # ordering it here orders both identically and keeps the comparison fair.
+        # It matters now that anniversaries are staggered: in customer-generation order a
+        # transaction due on day 59 would be processed before one due on day 31, which
+        # would make Pacing's "recent outcomes" window read the batch in an order the
+        # simulated clock never had. This does not make the window time-ordered — one
+        # transaction still runs all its retries before the next begins — it only stops
+        # the staggering from making that gap worse. See notes/TRACKER.md's
+        # "system-wide is processing-order" limitation.
+        self.billing_events.sort(key=lambda e: (e.scheduled_at, e.billing_event_id))
 
     def _assign_first_attempt_declines(self) -> None:
         """ARCHITECTURE.md A2 operations 4-5 — for each failed billing event, assign a

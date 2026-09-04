@@ -215,24 +215,20 @@ class CompletedRun:
 # scenario**: `SimulatorConfig` has carried that mode since Phase 2 (A2 operation 10) and
 # nothing in the UI had ever switched it on.
 #
-# **Switching it on is how a defect got found, and the control below is worded around
-# it.** A2 operation 10 describes the mode as forcing a share of billing events "onto the
-# exact same simulated instant" — a thundering herd for Jitter (IDEA.md §8c) to spread
-# out. It does force them onto one instant. What the docstring did not notice is that they
-# were already there: every customer is generated with the *same* billing cycle length, so
-# every charge in a cycle already falls on one simulated instant, toggle or no toggle. The
-# spaced-out "normal batch" that mode is documented as contrasting against does not exist
-# in this simulator.
+# **Switching it on is how a defect got found.** A2 operation 10 describes the mode as
+# forcing a share of billing events "onto the exact same simulated instant" — a thundering
+# herd for Jitter (IDEA.md §8c) to spread out. It did force them onto one instant. What
+# nobody had noticed is that they were *already* there: every customer was generated with
+# the same billing cycle length and the same start date, so every charge in a cycle fell on
+# one instant, toggle or no toggle, and the spaced-out "normal batch" the mode is
+# documented as contrasting against did not exist. The toggle was a volume dial wearing a
+# synchronisation label.
 #
-# So the toggle does something real, but not the thing it was described as doing: it
-# raises the *volume* of simultaneous failures (a 100-customer world at a 25% base rate
-# goes from 26 failures to 48), not their synchronisation. The label and help text below
-# say that, rather than the more flattering version. Fixing the simulator to stagger
-# customers' billing anniversaries would make the original claim true, but it changes
-# every hidden truth, every recorded figure and every run key in this project's notes —
-# so it is written up in `notes/TRACKER.md` as a decision for Phase 13, not taken
-# unilaterally here. `tests/test_dashboard.py` pins the current behaviour so the day
-# somebody does fix it, the doc claims that depend on it fail loudly.
+# Fixed in Phase 13: customers now renew on their own anniversary within the cycle
+# (`Customer.billing_anniversary_offset_days`), so the toggle changes both the volume and
+# the timing, and the help text below can describe it without a caveat. A 100-customer
+# world at a 25% base rate goes from 29 charging instants with 7 on the busiest, to a
+# forced 31 on one mid-cycle instant. `tests/test_dashboard.py` now asserts both halves.
 #
 # Everything here is *input*. This section chooses what world to build and how the agents
 # are configured; it computes nothing about the outcome, and it cannot: the run key shown
@@ -275,11 +271,12 @@ set while people watch.
 * **Standard world** — the configuration every number recorded in `notes/TRACKER.md` was
   produced under. This is the one to quote from.
 * **Mass failure** — the same world with the mass-failure scenario on: a third of the
-  population's charges are forced to fail regardless of the base rate, roughly doubling
-  how many failures the pacing has to spread out at once. Read the section comment above
-  before describing this as a "retry storm" to anybody: it increases the *number* of
-  simultaneous failures, not their simultaneity, because in this simulator every charge
-  in a cycle already lands on the same instant.
+  population's charges are dragged onto one mid-cycle instant and forced to fail
+  regardless of the base rate, roughly doubling how many failures the pacing has to spread
+  out at once. This is a genuine retry storm against an otherwise spread-out batch. One
+  caveat still worth stating if a judge presses: the pile-up is real in the data, but the
+  batch is processed one transaction at a time, so the agent does not *experience* it as
+  simultaneous pressure — see notes/TRACKER.md's "system-wide is processing-order" note.
 * **Quiet world** — a small population at a low failure rate, where nothing fails at all.
   Worth having as a preset rather than hiding: it is the run that has no recovery rate,
   and watching the page say "there is no denominator" instead of "0%" is the honesty
@@ -391,13 +388,11 @@ def sidebar_settings() -> RunSettings:
         "Mass failure (bank outage)",
         key="mass_failure",
         help=(
-            "Forces a share of the population's charges to fail regardless of the base "
-            "failure rate - a bank outage on renewal day - so the pacing has far more "
-            "simultaneous failures to spread out. **What it does not change:** every "
-            "charge in a billing cycle already falls on the same simulated instant here, "
-            "because every customer is generated with the same cycle length. This raises "
-            "the volume of failures at that instant, not their synchronisation. See "
-            "notes/TRACKER.md."
+            "Normally each customer renews on their own anniversary, so a batch's "
+            "charges are spread across the whole billing cycle. This forces a share of "
+            "them onto one mid-cycle instant *and* fails them regardless of the base "
+            "failure rate - a bank outage on renewal day - which is the thundering-herd "
+            "condition the jitter exists to spread back out."
         ),
     )
     if st.session_state["mass_failure"]:
