@@ -16,3 +16,16 @@ textColor = "#0b0b0b"
 
 [browser]
 gatherUsageStats = false
+
+[runner]
+# Streamlit's "magic" prints any bare value left on its own line in the entrypoint
+# script. Python's attribute-documentation convention — a string literal placed under a
+# constant to explain it — is exactly that shape, and Streamlit's own guard only exempts
+# the *first* string in a file (`_is_docstring_node`: `node_index == 0`). Every note under
+# every constant in dashboard/app.py was therefore being rendered onto the page, above the
+# title, before a run: ten paragraphs of internal commentary about label maps and colour
+# palettes. Disabled here rather than by rewriting those notes as `#` comments, because
+# this closes the whole class — the eleventh note somebody writes is safe too. Nothing in
+# this app relies on magic: every element it means to display is an explicit `st.` call,
+# and the only bare top-level expressions are function calls, which magic leaves alone.
+magicEnabled = false
